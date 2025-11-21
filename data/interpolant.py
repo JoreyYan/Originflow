@@ -1,21 +1,146 @@
 import torch
+import os
 
 import numpy as np
 from tqdm import tqdm
 
 from data import so3_utils
 from data import utils as du
-from scipy.spatial.transform import Rotation
+
 import copy
 from analysis.mask import design_masks,create_binder_mask
 from scipy.optimize import linear_sum_assignment
 from chroma.data.protein import Protein
 from models.symmetry import SymGen
 from chroma.layers.structure.mvn import BackboneMVNResidueGas
-
+from scipy.spatial.transform import Rotation as R
 from chroma.layers.structure.backbone import FrameBuilder
 from models.noise_schedule import OTNoiseSchedule
-from experiments.utils import get_global_seed
+import torch.nn.functional as F
+from data.average_rot import batch_masked_karcher_mean as parallel_karcher_mean
+def maskwise_avg_replace(tensor, mask):
+    # tensor: [B, N, ...]
+    # mask: [B, N]
+    while mask.dim() < tensor.dim():
+        mask = mask.unsqueeze(-1)
+    inverse_mask = (mask == 0)
+    avg_val = tensor[inverse_mask.expand(tensor.shape)].mean(dim=0)
+    return torch.where(inverse_mask, avg_val.view(*([1] * (tensor.dim() - avg_val.dim())), *avg_val.shape), tensor)
+
+
+def round_to(x, base=50):
+    """四舍五入到最接近的 base（默认 50）的倍数。"""
+    return int(base * round(float(x) / base))
+
+def steps_by_length(L):
+    """
+    根据序列长度 L（aa）返回建议步长（不考虑 schedule）：
+      - L < 80               -> 100
+      - 80 ≤ L < 100         -> 200
+      - 100 ≤ L ≤ 200        -> 200 + 三角峰（峰高300，中心150，两端100/200为0）
+      - 200 < L ≤ 250        -> 200
+      - 250 < L < 300        -> 500
+      - 300 ≤ L < 350        -> 从500线性过渡到1000
+      - 350 ≤ L ≤ 400        -> 1000
+      - L > 400              -> 1000（需要更稳可改成1500）
+    返回值四舍五入到最接近的50步。
+    """
+    L = float(L)
+
+    # 1) very short
+    if L < 80:
+        return 100
+    if L < 100:
+        return 200
+
+    # 2) 100~200：200 底座 + 三角峰（峰高=300，中心=150，两端=100/200 为 0）
+    if 100 <= L <= 200:
+        c, A, left, right = 150.0, 300.0, 100.0, 200.0
+        w = (right - left) / 2.0  # = 50
+        peak = max(0.0, 1.0 - abs(L - c) / w) * A
+        return round_to(200.0 + peak)
+
+    # 3) 200~250：固定 200
+    if L <= 250:
+        return 200
+
+    # 4) 250~300：固定 500
+    if L < 300:
+        return 500
+
+    # 5) 300~350：从 500 线性过渡到 1000
+    if L < 350:
+        steps = 500.0 + (L - 300.0) * (1000.0 - 500.0) / (350.0 - 300.0)
+        return round_to(steps)
+
+    # 6) 350~400：1000（如需更稳可改成1500）
+    if L <= 400:
+        return 1000
+
+    # 7) >400：默认 1000（按需调成 1500）
+    return 1000
+
+
+def karcher_mean_quaternion(quats, max_iter=50, tol=1e-6):
+    def log_map(q, mu):
+        dot = (q * mu).sum(-1, keepdim=True)
+        dot = torch.clamp(dot, -1.0, 1.0)
+        theta = torch.acos(dot)
+        v = q - dot * mu
+        v = F.normalize(v, dim=-1)
+        return theta * v
+
+    def exp_map(v, mu):
+        theta = torch.norm(v, dim=-1, keepdim=True)
+        sin_theta = torch.sin(theta)
+        cos_theta = torch.cos(theta)
+        v_norm = F.normalize(v, dim=-1)
+        return cos_theta * mu + sin_theta * v_norm
+
+    q_mean = quats[0].clone()
+    for _ in range(max_iter):
+        log_vs = log_map(quats, q_mean)  # [K, 4]
+        v_mean = log_vs.mean(dim=0, keepdim=True)
+        delta = v_mean.norm()
+        if delta < tol:
+            break
+        q_mean = exp_map(v_mean, q_mean)
+        q_mean = F.normalize(q_mean, dim=-1)
+    return q_mean[0]
+
+def batch_masked_karcher_mean(rot_mats: torch.Tensor, fixed_mask: torch.Tensor) -> torch.Tensor:
+    """
+    rot_mats: [B, N, 3, 3]
+    fixed_mask: [B, N] -> 0 indicates positions to be averaged and replaced
+    """
+    B, N, _, _ = rot_mats.shape
+    device = rot_mats.device
+    rot_out = rot_mats.clone()
+
+    for n in range(N):
+        # 找出该位置 n，所有 batch 中 fixed_mask==0 的旋转
+        valid_indices = (fixed_mask[:, n] == 0).nonzero(as_tuple=False).squeeze(-1)
+        if valid_indices.numel() == 0:
+            continue  # 没有需要替换的
+
+        selected_rot = rot_mats[valid_indices, n]  # [K, 3, 3]
+        # 转为 numpy 旋转矩阵
+        rots_np = selected_rot.detach().cpu().numpy()
+        quats_np = R.from_matrix(rots_np).as_quat()  # [K, 4]
+
+        quats = torch.tensor(quats_np, dtype=torch.float32, device=device)
+        # 做 Karcher mean
+        mean_quat = karcher_mean_quaternion(quats)  # [4]
+        # 转回旋转矩阵
+        mean_rot = R.from_quat(mean_quat.cpu().numpy()).as_matrix()
+        mean_rot = torch.tensor(mean_rot, dtype=torch.float32, device=device)  # [3, 3]
+
+        # 替换所有 batch 中该位置的 rot_mats
+        for b in valid_indices:
+            rot_out[b, n] = mean_rot
+
+    return rot_out
+
 
 def SS_mask(ss, fixed_mask,design=False):
     if  design:
@@ -87,7 +212,7 @@ def _centered_gaussian(num_batch, num_res, atoms,device='cuda'):
 
 def _uniform_so3(num_batch, num_res, device):
     return torch.tensor(
-        Rotation.random(num_batch*num_res).as_matrix(),
+        R.random(num_batch*num_res).as_matrix(),
         device=device,
         dtype=torch.float32,
     ).reshape(num_batch, num_res, 3, 3)
@@ -795,8 +920,7 @@ class Interpolant_10:
 
         return noisy_batch
 
-
-    def corrupt_batch_binder(self, batch,precision,binder_mask=None,design_num=0,t=None,design=False,path=None,hotspot=False):
+    def corrupt_batch_DYNbinder(self, batch,precision,binder_mask=None,design_num=0,t=None,design=False,path=None,hotspot=False):
         '''
         这部分主要是用于binder的训练，增加了SS 数据，和毗邻矩阵，且也增加了b-factor的部分，还有chi 角
         binder mask 是要固定的位置
@@ -804,8 +928,10 @@ class Interpolant_10:
         hotspot  if true, it as center
         '''
 
-        # save_pdb_chain(batch['atoms14'][0][:,:4,:].reshape(-1, 3).cpu().numpy(), batch['chain_idx'][0].cpu().numpy(),
-        #                f'/{path}/native_nonoise_{str(design_num)}.pdb')
+        save_pdb_chain(batch['atoms14'][0][:,:4,:].reshape(-1, 3).cpu().numpy(), batch['chain_idx'][0].cpu().numpy(),
+                       f'/{path}/native_0_nonoise_{str(design_num)}.pdb')
+        save_pdb_chain(batch['atoms14'][1][:,:4,:].reshape(-1, 3).cpu().numpy(), batch['chain_idx'][0].cpu().numpy(),
+                       f'/{path}/native_1_nonoise_{str(design_num)}.pdb')
 
         # if not hotspot:
         #     # use new center
@@ -889,6 +1015,145 @@ class Interpolant_10:
         noisy_batch['trans_t'] = trans_t
         noisy_batch['rotmats_t'] = rotmats_t
         noisy_batch['bbatoms_t'] = self.frame_builder(rotmats_t, trans_t, chain_idx).float()
+
+        # 替换 binder_mask==0 的区域为 batch=0 的数据
+        for key in ['atoms14', 'bbatoms', 'trans_1', 'rotmats_1', 'trans_t', 'rotmats_t', 'bbatoms_t']:
+            if key in noisy_batch:
+                data = noisy_batch[key]  # shape: [B, N, 14, 3] or similar
+                mask = binder_mask  # shape: [B, N]
+
+                # Ensure mask is broadcastable to data
+                while mask.dim() < data.dim():
+                    mask = mask.unsqueeze(-1)  # shape: [B, N, 1] -> [B, N, 1, 1] etc.
+
+                B = data.shape[0]
+                for b in range(1, B):
+                    # data[b] = where(mask[b] == 0, data[0], data[b])
+                    # torch.where(cond, A, B): where cond==True, pick A, else pick B
+
+                    data[b] = torch.where(mask[b].expand(data[0].shape) == 0, data[0], data[b])
+
+                noisy_batch[key] = data
+
+        # noisy_batch=self._center_bbatoms_t(noisy_batch)
+        # rotmats_t,trans_t, _q=self.frame_builder.inverse(noisy_batch['bbatoms_t'],chain_idx)
+        # noisy_batch['trans_t']=trans_t
+        # noisy_batch['rotmats_t'] =rotmats_t
+
+        if path is not None:
+
+
+            save_pdb_chain(noisy_batch['bbatoms_t'][0].reshape(-1,3).cpu().numpy(),chain_idx[0].cpu().numpy(), f'/{path}/center_{str(design_num)}.pdb')
+
+            # save_pdb_chain(bbatoms[0].reshape(-1, 3).cpu().numpy(), chain_idx[0].cpu().numpy(),
+            #                f'{path}/native_x0_{str(design_num)}.pdb')
+
+        return noisy_batch
+    def corrupt_batch_binder(self, batch,precision,binder_mask=None,design_num=0,t=None,design=False,path=None,hotspot=False):
+        '''
+        这部分主要是用于binder的训练，增加了SS 数据，和毗邻矩阵，且也增加了b-factor的部分，还有chi 角
+        binder mask 是要固定的位置
+
+        hotspot  if true, it as center
+        '''
+
+        # save_pdb_chain(batch['atoms14'][0][:,:4,:].reshape(-1, 3).cpu().numpy(), batch['chain_idx'][0].cpu().numpy(),
+        #                f'/{path}/native_nonoise_{str(design_num)}.pdb')
+
+        # if not hotspot:
+        #     # use new center
+        #     if design:
+        #         # use fixed area to compute zeros
+        #         batch = self._motif_center(batch)
+        #     else:
+        #         # batch=self._center(batch)  如果对整体进行中心化，其实会暴露binder的位置，所以应该以target为中心
+        #         batch = self._motif_center(batch)
+
+
+        if precision == 'fp16':
+            batch['atoms14_b_factors']=batch['atoms14_b_factors'].half()
+        else:
+            batch['atoms14_b_factors']=batch['atoms14_b_factors'].float()
+
+
+
+        noisy_batch = copy.deepcopy(batch)
+
+        # [B, N]
+        res_mask = batch['res_mask']
+        num_batch, _ = res_mask.shape
+        # print(res_mask.shape)
+        bbatoms = batch['atoms14'][...,:4,:] # Angstrom
+
+        if binder_mask is None:
+            binder_mask=create_binder_mask(batch['com_idx'],batch['chain_idx']).int()
+        else:
+            binder_mask=binder_mask.int()
+        noisy_batch['fixed_mask'] = binder_mask
+        noisy_batch['bbatoms'] = bbatoms
+        fixed_mask=binder_mask
+
+        if not hotspot:
+            noisy_batch = self._binder_center(noisy_batch)
+
+        batch['ss'] = SS_mask(batch['ss'],fixed_mask,design)
+        noisy_batch['ss'] = batch['ss']
+
+        # save_pdb(bbatoms[0].reshape(-1,3), 'motif.pdb')
+        chain_idx = batch['chain_idx']
+        gt_rotmats_1, gt_trans_1, _q = self.frame_builder.inverse(noisy_batch['bbatoms'] , chain_idx)  # frames in new rigid system
+        trans_1 = gt_trans_1
+        rotmats_1 = gt_rotmats_1
+
+
+
+
+        noisy_batch['trans_1'] = trans_1
+        noisy_batch['rotmats_1'] = rotmats_1
+
+
+        if t is None:
+            # [B, 1]
+            t = self.sample_t(num_batch)[:, None]
+            noisy_batch['t'] = t
+        else:
+            ## when inference, set t=0,mean start from 1st  t=1 mean fixed not change
+            sample_t = self.sample_t(num_batch)[:, None]
+            t=torch.ones_like(sample_t)*t
+            noisy_batch['t'] = t
+
+        # Apply corruptions
+        # init
+        rg = (2 / np.sqrt(3)) * (chain_idx.shape[1]-binder_mask.sum()) ** 0.4
+        self.backbone_init._register(stddev_CA=rg, device=self._device)
+
+        if not design:
+            trans_t = self._corrupt_trans(trans_1, t,rg, res_mask,fixed_mask,design)
+            rotmats_t = self._corrupt_rotmats(rotmats_1, t, res_mask,fixed_mask)
+        else:
+            trans_0 = _centered_gaussian(
+                num_batch, trans_1.shape[1], None, self._device) * rg
+
+            diffuse_mask=res_mask * (1-fixed_mask)
+            trans_t = _trans_diffuse_mask(trans_0, trans_1,diffuse_mask )
+
+            rotmats_0 = _uniform_so3(num_batch, trans_1.shape[1], self._device)
+
+            rotmats_t = _rots_diffuse_mask(rotmats_0, rotmats_1, diffuse_mask)
+
+        # def _center(_X):
+        #     _X = _X - _X.mean(1, keepdim=True)
+        #     return _X
+        #
+        # trans_t=_center(trans_t)
+
+        trans_t=trans_t-(trans_t*fixed_mask[...,None].float()).mean(1, keepdim=True)
+
+        noisy_batch['trans_t'] = trans_t
+        noisy_batch['rotmats_t'] = rotmats_t
+        noisy_batch['bbatoms_t'] = self.frame_builder(rotmats_t, trans_t, chain_idx).float()
+
+
 
         # noisy_batch=self._center_bbatoms_t(noisy_batch)
         # rotmats_t,trans_t, _q=self.frame_builder.inverse(noisy_batch['bbatoms_t'],chain_idx)
@@ -982,6 +1247,211 @@ class Interpolant_10:
 
         return trans_t + vf * d_t
 
+    def pf_ode_step(self, dt, t,  trans_1, trans_t,eps=1e-5):
+        """
+        Stable PF-ODE step for R^3 with t: 1 -> 0 (so typically dt < 0).
+        Matches your stable implementation's behavior but keeps the PF-ODE form.
+
+        x_{t+dt} = x_t + [ f(x_t,t) - 0.5 * g^2(t) * score_hat * temp ] * dt
+        where:
+          f(x,t) = + x/t       (since dt < 0; equals -x/t * |dt| ),
+          g^2(t) = (2 - 2*t)/t (your schedule; damped near t≈1),
+          score_hat = (trans_t - t*trans_1) / (1 - t)^2   # NOTE: flipped sign vs. before
+          temp = λ0 / (t^2 + (1 - t^2) * λ0)
+        """
+        # 1) clamp t for stability
+        t = t.clamp(min=eps, max=1 - eps)
+
+        # 2) your temperature reweighting
+        lambda_0 = getattr(self._cfg, "temp", 1.0) or 1.0
+        temp = lambda_0 / (t ** 2 + (1.0 - t ** 2) * lambda_0)
+
+        # 3) drift f and schedule g^2 consistent with your stable code
+        f = trans_t / t  # with dt<0 this equals (-x/t)*|dt|
+        g2 = (2.0 - 2.0 * t) / t  # damped near t≈1, ~2/t near t≈0
+
+        # 4) use score_hat = - previous score  ==> aligns with PF-ODE "minus" sign
+        score_hat = (trans_t - t * trans_1) / (1.0 - t) ** 2
+
+        # 5) PF-ODE drift (minus sign), but with your schedule/temperature
+        drift = f - 0.5 * g2 * score_hat * temp
+
+        # 6) Euler step
+        x_next = trans_t + drift * dt
+
+        # optional: numeric guards (clip huge steps, squash NaN/Inf)
+        # x_next = torch.nan_to_num(x_next, nan=0.0, posinf=1e6, neginf=-1e6)
+
+        return x_next,drift
+
+    def heun_step_R3(self, dt, t, trans_1, trans_t,  eps=1e-5):
+        """
+        Heun（改进欧拉）：
+          1) 预测: x' = x + drift(x,t)*dt
+          2) 校正: drift' = drift(x', t+dt)
+          3) 合成: x_next = x + 0.5*(drift + drift')*dt
+        """
+        # predictor
+        _,drift1 = self.pf_ode_step(dt,t, trans_1, trans_t, eps=eps)
+        x_pred = trans_t + drift1 * dt
+
+        # corrector
+        t2 = (t + dt).clamp(min=eps, max=1 - eps)  # 反向时间
+        _,drift2 = self.pf_ode_step(dt,t2, trans_1, x_pred, eps=eps)
+
+        x_next = trans_t + 0.5 * (drift1 + drift2) * dt
+
+        return x_next
+
+    def make_sigma_t_fn(self):
+        if self._rots_cfg.sample_schedule == "linear":
+            def sigma_t_fn(t):
+                eps = 1e-6
+                return (1.0 - t).clamp(min=eps)
+        elif self._rots_cfg.sample_schedule == "exp":
+            k = getattr(self._rots_cfg, "exp_k", 1.0)  # 你之前用的因子
+            rate = self._rots_cfg.exp_rate
+
+            def sigma_t_fn(t):
+                return torch.exp(-(rate / k) * (1.0 - t)).clamp(min=1e-6)
+        else:
+            raise ValueError(f"Unknown schedule {self._rots_cfg.sample_schedule}")
+        return sigma_t_fn
+
+    def heun_step_SO3(
+            self,
+            dt, t, R_1, R_t,
+            temp: float = 1.0,
+            eps: float = 1e-6,
+            project: bool = False,  # A/B 对比先关；实际可开
+            use_trust_region: bool = True,  # score 不超过主项一定比例
+            c: float = 0.3,  # 0.3~0.7；默认0.5
+    ):
+        """
+        SO(3) Heun（右乘指数映射）
+          1) omega1 = drift(R_t, t,  σ(t))
+          2) R_pred = R_t * Exp(dt * omega1)
+          3) omega2 = drift(R_pred, t+dt, σ(t+dt))
+          4) omega = 0.5*(omega1 + omega2); R_next = R_t * Exp(dt * omega)
+        """
+        dt = dt.to(R_1.device)
+        t = t.to(R_1.device)
+        t1 = t.clamp(min=eps, max=1.0 - eps)
+        t2 = (t + dt).clamp(min=eps, max=1.0 - eps)
+
+        # σ(t)（只随时间）：与你训练 schedule 一致
+        if self._rots_cfg.sample_schedule == "linear":
+            sigma_t1 = (1.0 - t1).clamp(min=eps)
+            sigma_t2 = (1.0 - t2).clamp(min=eps)
+        elif self._rots_cfg.sample_schedule == "exp":
+            rate = self._rots_cfg.exp_rate
+            k = getattr(self._rots_cfg, "exp_k", 1.0)
+            sigma_t1 = torch.exp(-(rate / k) * (1.0 - t1)).clamp(min=eps)
+            sigma_t2 = torch.exp(-(rate / k) * (1.0 - t2)).clamp(min=eps)
+        else:
+            raise ValueError(f"Unknown schedule {self._rots_cfg.sample_schedule}")
+
+        # 漂移1
+        omega1 = so3_utils.so3_omega_drift_time(
+            R_t=R_t, R_1=R_1, t=t1,
+            exp_rate=self._rots_cfg.exp_rate,
+            sigma_t=sigma_t1, temp=temp, eps=eps,
+        )
+
+        # （可选）信任域：限制 score 相对主项
+        if use_trust_region:
+            xi = so3_utils.calc_rot_vf(R_t, R_1)
+            f = self._rots_cfg.exp_rate * xi
+            corr1 = omega1 - f
+            f_norm = torch.norm(f, dim=-1, keepdim=True) + 1e-8
+            s_norm = torch.norm(corr1, dim=-1, keepdim=True) + 1e-8
+            scale = torch.clamp(c * f_norm / s_norm, max=1.0)
+            omega1 = f + scale * corr1
+
+        # 预测
+        dR1 = so3_utils.rotvec_to_rotmat(omega1 * dt[..., None])
+        R_pred = so3_utils.rot_mult(R_t, dR1)
+        if project:
+            R_pred = so3_utils.project_to_so3_fast(R_pred)
+
+        # 漂移2（t+dt，用 σ(t+dt)）
+        omega2 = so3_utils.so3_omega_drift_time(
+            R_t=R_pred, R_1=R_1, t=t2,
+            exp_rate=self._rots_cfg.exp_rate,
+            sigma_t=sigma_t2, temp=temp, eps=eps,
+        )
+        if use_trust_region:
+            xi2 = so3_utils.calc_rot_vf(R_pred, R_1)
+            f2 = self._rots_cfg.exp_rate * xi2
+            corr2 = omega2 - f2
+            f2_norm = torch.norm(f2, dim=-1, keepdim=True) + 1e-8
+            s2_norm = torch.norm(corr2, dim=-1, keepdim=True) + 1e-8
+            scale2 = torch.clamp(c * f2_norm / s2_norm, max=1.0)
+            omega2 = f2 + scale2 * corr2
+
+        # 合成 + 更新
+        omega = 0.5 * (omega1 + omega2)
+        import math
+        theta_max = math.radians(6.5)
+        theta = torch.norm(omega, dim=-1, keepdim=True) * dt.abs()[..., None]
+        scale = (theta_max / theta.clamp_min(1e-12)).clamp(max=1.0)
+        omega = omega * scale
+
+        dR = so3_utils.rotvec_to_rotmat(omega * dt[..., None])
+        R_next = so3_utils.rot_mult(R_t, dR)
+        if project:
+            R_next = so3_utils.project_to_so3_fast(R_next)
+
+        # with torch.no_grad():
+        #
+        #     rel = (torch.norm(omega2 - omega1, dim=-1) / (torch.norm(omega1, dim=-1) + 1e-8)).mean()
+        #     print("Heun correction rel:", rel.item())
+        #
+        #     r = (torch.norm(omega1 - f, dim=-1) / (torch.norm(f, dim=-1) + 1e-8)).mean()
+        #     print("score/f ratio:", r.item())
+
+        return R_next
+
+    def sde_step(self, dt, t, trans_1, trans_t, eps=1e-5, noise_scale=1.0):
+        """
+        Reverse SDE step for R^3 with t: 1 -> 0 (so typically dt < 0).
+
+        x_{t+dt} = x_t + [ f(x_t,t) - g^2(t) * score_hat * temp ] * dt  +  g(t) dW
+        where (kept consistent with your PF-ODE setup):
+          f(x,t)     = + x/t                 # with dt<0 equals (-x/t)*|dt|
+          g^2(t)     = (2 - 2*t)/t
+          score_hat  = (trans_t - t*trans_1) / (1 - t)^2   # flipped sign vs. original score
+          temp       = λ0 / (t^2 + (1 - t^2) * λ0)
+          dW ~ N(0, |dt| I) implemented as sqrt(|dt|) * N(0, I)
+
+        noise_scale: extra knob (default 1.0); set <1 to reduce stochasticity, >1 to increase.
+        """
+        # 1) clamp t for stability
+        t = t.clamp(min=eps, max=1 - eps)
+
+        # 2) temperature reweighting (same as your PF-ODE)
+        lambda_0 = getattr(self._cfg, "temp", 1.0) or 1.0
+        temp = lambda_0 / (t ** 2 + (1.0 - t ** 2) * lambda_0)
+
+        # 3) drift pieces (same schedules as PF-ODE)
+        f = trans_t / t  # drift base
+        g2 = (2.0 - 2.0 * t) / t  # gentle schedule
+
+        # 4) score with flipped sign (to align with PF-ODE's "minus" form)
+        score_hat = (trans_t - t * trans_1) / (1.0 - t) ** 2
+
+        # 5) reverse SDE drift: f - g^2 * score_hat * temp
+        drift = f - g2 * score_hat * temp
+
+        # 6) Euler–Maruyama noise term: g * dW, with dW ~ N(0, |dt| I)
+        #    -> std = sqrt(g^2 * |dt|) = sqrt(g2) * sqrt(|dt|)
+        std = (g2.clamp_min(0.0)).sqrt() * (dt.abs().sqrt()) * noise_scale
+        dW = torch.randn_like(trans_t) * std
+
+        # 7) update
+        x_next = trans_t + drift * dt + dW
+        return x_next
+
     def _X_Temp_motif_euler_step(self, d_t, t, trans_f,trans_1, trans_t,fixed_mask,theta):
         temp = self._cfg.temp
         h=1/t
@@ -1017,6 +1487,33 @@ class Interpolant_10:
                 f'Unknown sample schedule {self._rots_cfg.sample_schedule}')
         return so3_utils.geodesic_t(
             scaling * d_t, rotmats_1, rotmats_t)
+
+    def _pf_ode_drift_SO3(self, d_t, t, rotmats_1, rotmats_t, temp=1.0, eps=1e-6):
+        """
+        兼容旧接口，但只返回 omega_step（不再用 d_t、不更新矩阵）。
+        σ 只按时间计算，与训练 schedule 对齐。
+        """
+        t_safe = t.clamp(min=eps, max=1.0 - eps)
+        if self._rots_cfg.sample_schedule == "linear":
+            sigma_t = (1.0 - t_safe).clamp(min=eps)
+        elif self._rots_cfg.sample_schedule == "exp":
+            rate = self._rots_cfg.exp_rate
+            k = getattr(self._rots_cfg, "exp_k", 1.0)
+            sigma_t = torch.exp(-(rate / k) * (1.0 - t_safe)).clamp(min=eps)
+        else:
+            raise ValueError(f"Unknown schedule {self._rots_cfg.sample_schedule}")
+
+        omega_step = so3_utils.so3_omega_drift_time(
+            R_t=rotmats_t,
+            R_1=rotmats_1,
+            t=t_safe.to(rotmats_1.device),
+            exp_rate=self._rots_cfg.exp_rate,
+            sigma_t=sigma_t.to(rotmats_1.device),
+            temp=temp,
+            eps=eps,
+        )
+        return omega_step
+
     def _rots_motif_euler_step(self, d_t, t, rotmats_f,rotmats_1,rotmats_t,fixed_mask,theta):
         if self._rots_cfg.sample_schedule == 'linear':
             scaling = 1 / (1 - t)
@@ -1248,8 +1745,28 @@ class Interpolant_10:
             'ss':torch.zeros_like(res_mask).long(),}
 
         # Set-up time
+        # step=np.clip(round(self._sample_cfg.Scaling_coefficient * num_res**self._sample_cfg.Scaling_exponent), min=50, max=1200)
+        step=steps_by_length(num_res)
+
+        # if num_res<100:
+        #     step=200
+        # elif 100<=num_res<200:
+        #     step=500
+        # elif 200<=num_res<250:
+        #     step=200
+
         ts = torch.linspace(
             self._cfg.min_t, 1.0, self._sample_cfg.num_timesteps)
+        # gamma = 2.0
+        # ts = 1.0 - (1.0 - ts) ** gamma
+
+        # ts = self._cfg.min_t + (1.0 - self._cfg.min_t) * (1 - torch.cos(
+        #     ((torch.arange(self._sample_cfg.num_timesteps,
+        #                    dtype=torch.float32) / self._sample_cfg.num_timesteps) + 0.008)
+        #     / (1 + 0.008) * np.pi / 2
+        # ) ** 2)
+
+
         t_1 = ts[0]
 
         prot_traj = [(trans_0, rotmats_0)]
@@ -1291,6 +1808,123 @@ class Interpolant_10:
                 batch['trans_sc'] = trans_t_2
 
             rotmats_t_2 = self._rots_euler_step(
+                d_t, t_1, pred_rotmats_1, rotmats_t_1)
+            prot_traj.append((trans_t_2, rotmats_t_2))
+            t_1 = t_2
+
+        # We only integrated to min_t, so need to make a final step
+        t_1 = ts[-1]
+        trans_t_1, rotmats_t_1 = prot_traj[-1]
+        batch['trans_t'] = trans_t_1
+        batch['rotmats_t'] = rotmats_t_1
+        batch['bbatoms_t'] = self.frame_builder(rotmats_t_1.float(), trans_t_1, chain_idx)
+        batch['t'] = torch.ones((num_batch, 1), device=self._device) * t_1
+        with torch.no_grad():
+            model_out = model(batch)
+        pred_trans_1 = model_out['pred_trans']
+        pred_rotmats_1 = model_out['pred_rotmats']
+        clean_traj.append(
+            (pred_trans_1.detach().cpu(), pred_rotmats_1.detach().cpu())
+        )
+        prot_traj.append((pred_trans_1, pred_rotmats_1))
+
+        # Convert trajectories to atom37.
+        # atom37_traj = all_atom.transrot_to_atom37(prot_traj, res_mask)
+        atom37_traj = self.frame_builder(pred_rotmats_1, pred_trans_1, chain_idx).detach().cpu()
+
+        S=torch.ones_like(chain_idx)
+        return atom37_traj.detach().cpu(),chain_idx.detach().cpu(),S.detach().cpu()
+
+    def heun_sample(
+            self,
+            num_batch,
+            num_res,
+            model,
+    ):
+        res_mask = torch.ones(num_batch, num_res, device=self._device)
+        chain_idx = torch.ones(num_batch, num_res, device=self._device)
+        res_idx=torch.arange(num_res,device=self._device)[None]
+        rg = (2 / np.sqrt(3)) * chain_idx.shape[1] ** 0.4
+        # Set-up initial prior samples
+        trans_0 = _centered_gaussian(
+            num_batch, num_res, None, self._device) * rg
+
+        rotmats_0 = _uniform_so3(num_batch, num_res, self._device)
+
+        trans_0 = trans_0
+        rotmats_0 = rotmats_0
+
+        batch = {
+            'res_idx':res_idx ,
+            'res_mask': res_mask,
+            'chain_idx': chain_idx,
+            'fixed_mask':res_mask*0,
+            'ss':torch.zeros_like(res_mask).long(),}
+
+        # Set-up time
+        # step=np.clip(round(self._sample_cfg.Scaling_coefficient * num_res**self._sample_cfg.Scaling_exponent), min=50, max=1200)
+        step=steps_by_length(num_res)
+
+        # if num_res<100:
+        #     step=200
+        # elif 100<=num_res<200:
+        #     step=500
+        # elif 200<=num_res<250:
+        #     step=200
+
+        ts = torch.linspace(
+            self._cfg.min_t, 1.0, self._sample_cfg.num_timesteps)
+        # gamma = 2.0
+        # ts = 1.0 - (1.0 - ts) ** gamma
+
+        # ts = self._cfg.min_t + (1.0 - self._cfg.min_t) * (1 - torch.cos(
+        #     ((torch.arange(self._sample_cfg.num_timesteps,
+        #                    dtype=torch.float32) / self._sample_cfg.num_timesteps) + 0.008)
+        #     / (1 + 0.008) * np.pi / 2
+        # ) ** 2)
+
+
+        t_1 = ts[0]
+
+        prot_traj = [(trans_0, rotmats_0)]
+        clean_traj = []
+        print(f'Running {self._sample_cfg.num_timesteps} timesteps')
+        for t_2 in tqdm(ts[1:], leave=True, desc='time step', ncols=100, dynamic_ncols=True, position=0):
+
+            # Run model.
+            trans_t_1, rotmats_t_1 = prot_traj[-1]
+            batch['trans_t'] = trans_t_1
+            batch['rotmats_t'] = rotmats_t_1
+            bb_atoms_t = self.frame_builder(rotmats_t_1.float(), trans_t_1, chain_idx)
+            batch['bbatoms_t'] = bb_atoms_t
+
+            t = torch.ones((num_batch, 1), device=self._device) * t_1
+            batch['t'] = t
+            with torch.no_grad():
+                model_out = model(batch)
+
+            # Process model output.
+            pred_trans_1 = model_out['pred_trans']
+            pred_rotmats_1 = model_out['pred_rotmats']
+            clean_traj.append(
+                (pred_trans_1.detach().cpu(), pred_rotmats_1.detach().cpu())
+            )
+
+
+            # Take reverse step
+            d_t = t_2 - t_1
+            trans_t_2 = self.heun_step_R3(
+                d_t, t_1, pred_trans_1, trans_t_1)
+
+            def _center(_X):
+                _X = _X - _X.mean(1, keepdim=True)
+                return _X
+
+            trans_t_2 = _center(trans_t_2)
+            if self._cfg.self_condition:
+                batch['trans_sc'] = trans_t_2
+
+            rotmats_t_2 = self.heun_step_SO3(
                 d_t, t_1, pred_rotmats_1, rotmats_t_1)
             prot_traj.append((trans_t_2, rotmats_t_2))
             t_1 = t_2
@@ -1564,7 +2198,7 @@ class Interpolant_10:
         bbatoms = self.backbone_init.sample(chain_idx, Z=z) # nm_SCALE
         return bbatoms
 
-    def _init_complex_backbone(self,num_batch, num_res):
+    def _init_complex_backbone(self,num_batch, num_res,rgadd=1):
 
         chain_idx = torch.cat(
             [torch.full([rep], i+1) for i, rep in enumerate(num_res)]
@@ -1574,6 +2208,7 @@ class Interpolant_10:
         num_res=chain_idx.shape[1]
 
         rg = (2 / np.sqrt(3)) * chain_idx.shape[1] ** 0.4
+        rg=rg*rgadd
         # Set-up initial prior samples
         trans_0 = _centered_gaussian(
             num_batch, num_res, None, self._device) * rg
@@ -1581,6 +2216,163 @@ class Interpolant_10:
         rotmats_0 = _uniform_so3(num_batch, num_res, self._device)
 
         return res_mask, chain_idx, trans_0, rotmats_0,rg
+
+    def _align_prediction_to_motif_per_chain(self, pred_trans, pred_rotmats, trans_motif, rotmats_motif, chain_idx, fixed_mask):
+        """
+        Align each chain's prediction to its original motif using Kabsch algorithm on atom positions.
+
+        For each chain:
+        1. Extract motif atom positions (pred vs orig)
+        2. Use Kabsch to find optimal R and t: orig = pred @ R + t
+        3. Apply (R, t) to entire chain
+
+        Args:
+            pred_trans: Predicted translations [B, L, 3]
+            pred_rotmats: Predicted rotations [B, L, 3, 3]
+            trans_motif: Original motif translations [B, L, 3]
+            rotmats_motif: Original motif rotations [B, L, 3, 3]
+            chain_idx: Chain indices [B, L]
+            fixed_mask: Motif mask [B, L]
+
+        Returns:
+            aligned_trans: Aligned translations [B, L, 3]
+            aligned_rotmats: Aligned rotations [B, L, 3, 3]
+        """
+        from data.utils import align_structures
+
+        device = pred_trans.device
+        num_batch = pred_trans.shape[0]
+        aligned_trans = pred_trans.clone()
+        aligned_rotmats = pred_rotmats.clone()
+
+        # Get unique chains
+        unique_chains = torch.unique(chain_idx[0])
+
+        for chain_id in unique_chains:
+            # Get mask for this chain
+            chain_mask = (chain_idx[0] == chain_id)  # [L]
+
+            # Get motif mask for this chain
+            motif_mask_chain = fixed_mask[0, chain_mask].bool()  # [chain_len]
+
+            if not motif_mask_chain.any():
+                # No motif in this chain, skip alignment
+                continue
+
+            # Extract motif atom positions for this chain
+            pred_trans_chain = pred_trans[:, chain_mask, :]  # [B, chain_len, 3]
+            trans_motif_chain = trans_motif[:, chain_mask, :]  # [B, chain_len, 3]
+
+            pred_motif_atoms = pred_trans_chain[:, motif_mask_chain, :]  # [B, n_motif, 3]
+            orig_motif_atoms = trans_motif_chain[:, motif_mask_chain, :]  # [B, n_motif, 3]
+
+            n_motif = pred_motif_atoms.shape[1]
+          #  print(f'[Align] Chain {chain_id.item()}: Using Kabsch on {n_motif} motif atoms')
+
+            # Flatten for align_structures: [B*n_motif, 3]
+            pred_flat = pred_motif_atoms.reshape(-1, 3)
+            orig_flat = orig_motif_atoms.reshape(-1, 3)
+            batch_indices = torch.arange(num_batch, device=device).repeat_interleave(n_motif)
+
+            # Use Kabsch algorithm to get rotation matrix
+            _, _, R = align_structures(pred_flat, batch_indices, orig_flat)
+
+            # Step 1: Rotate pred_motif_atoms first
+            pred_motif_rotated = torch.einsum('bnc,bcd->bnd', pred_motif_atoms, R.float())  # [B, n_motif, 3]
+
+            # Step 2: Check difference for EACH atom (not mean!)
+            diff_per_atom = orig_motif_atoms - pred_motif_rotated  # [B, n_motif, 3]
+
+            # print(f'[Align] Chain {chain_id.item()}: After rotation, per-atom differences:')
+            # for i in range(min(n_motif, 10)):  # Show first 10 atoms
+            #     diff_vec = diff_per_atom[0, i].cpu().numpy()
+            #     dist = torch.norm(diff_per_atom[0, i]).item()
+            #     print(f'  Atom {i}: diff={diff_vec}, distance={dist:.3f} Å')
+
+            # Step 3: Compute translation as mean of differences
+            t = diff_per_atom.mean(dim=1, keepdim=True)  # [B, 1, 3]
+
+            # print(f'  Mean translation needed: {t.squeeze().cpu().numpy()}')
+            # print(f'  Rotation trace: {R[0].trace().item():.3f}')
+
+            # Apply transformation to entire chain: aligned = trans @ R + t
+            chain_trans_full = pred_trans[:, chain_mask, :]  # [B, chain_len, 3]
+            chain_rotmats_full = pred_rotmats[:, chain_mask, :, :]  # [B, chain_len, 3, 3]
+
+            chain_len = chain_trans_full.shape[1]
+
+            # Transform translations: trans_aligned = trans @ R + t
+            # [B, chain_len, 3] @ [B, 3, 3] -> [B, chain_len, 3]
+            trans_aligned = torch.einsum('blc,bcd->bld', chain_trans_full, R.float()) + t
+
+            # Transform rotations: rotmats_aligned = R @ rotmats
+            # [B, 3, 3] @ [B, chain_len, 3, 3] -> [B, chain_len, 3, 3]
+            rotmats_aligned = torch.einsum('bik,bljk->blij', R.float(), chain_rotmats_full)
+
+            # Update aligned tensors
+            aligned_trans[:, chain_mask, :] = trans_aligned
+            aligned_rotmats[:, chain_mask, :, :] = rotmats_aligned
+
+        return aligned_trans, aligned_rotmats
+
+    def _init_per_chain_around_motif(self, num_batch, chain_idx, fixed_mask, trans_motif, rotmats_motif, rgadd=1.0):
+        """
+        Initialize each chain separately, centered around its own motif region.
+
+        Args:
+            num_batch: Batch size
+            chain_idx: Chain indices [B, L]
+            fixed_mask: Motif mask [B, L] (1 = motif, 0 = scaffold)
+            trans_motif: Motif translations [B, L, 3]
+            rotmats_motif: Motif rotations [B, L, 3, 3]
+            rgadd: Radius of gyration multiplier
+
+        Returns:
+            trans_0: Initial translations [B, L, 3]
+            rotmats_0: Initial rotations [B, L, 3, 3]
+        """
+        device = chain_idx.device
+        total_len = chain_idx.shape[1]
+
+        # Get unique chain IDs
+        unique_chains = torch.unique(chain_idx[0])
+        print(f'[Init] Initializing {len(unique_chains)} chains separately')
+
+        # Initialize output tensors
+        trans_0 = torch.zeros(num_batch, total_len, 3, device=device)
+        rotmats_0 = torch.zeros(num_batch, total_len, 3, 3, device=device)
+
+        for chain_id in unique_chains:
+            # Get mask for this chain
+            chain_mask = (chain_idx[0] == chain_id)  # [L]
+            chain_indices = torch.where(chain_mask)[0]
+            chain_len = chain_indices.shape[0]
+
+            # Get motif mask for this chain
+            motif_mask_chain = fixed_mask[0, chain_mask].bool()  # [chain_len]
+
+            if motif_mask_chain.any():
+                # Calculate motif center for this chain
+                motif_trans_chain = trans_motif[:, chain_mask, :]  # [B, chain_len, 3]
+                motif_center = motif_trans_chain[:, motif_mask_chain, :].mean(dim=1, keepdim=True)  # [B, 1, 3]
+                print(f'[Init] Chain {chain_id.item()}: {chain_len} residues, {motif_mask_chain.sum().item()} motif residues, center={motif_center.squeeze().cpu().numpy()}')
+            else:
+                # No motif in this chain, use zero center
+                motif_center = torch.zeros(num_batch, 1, 3, device=device)
+                print(f'[Init] Chain {chain_id.item()}: {chain_len} residues, no motif')
+
+            # Calculate rg for this chain
+            rg = (2 / np.sqrt(3)) * chain_len ** 0.4 * rgadd
+
+            # Initialize random positions around motif center for this chain
+            trans_chain = _centered_gaussian(num_batch, chain_len, None, device) * rg + motif_center  # [B, chain_len, 3]
+            rotmats_chain = _uniform_so3(num_batch, chain_len, device)  # [B, chain_len, 3, 3]
+
+            # Place into output tensors
+            trans_0[:, chain_mask, :] = trans_chain
+            rotmats_0[:, chain_mask, :, :] = rotmats_chain
+
+        return trans_0, rotmats_0
     def hybrid_Complex_sample(
             self,
             num_batch,
@@ -1704,7 +2496,7 @@ class Interpolant_10:
         chains=[]
         from data.utils import chain_str_to_int,CHAIN_TO_INT
         for i in chain_idx:
-            chains.append(int(CHAIN_TO_INT[i]))
+            chains.append(int(CHAIN_TO_INT[i])-25)
 
 
         chain_idx=torch.tensor(chains).to(res_mask.device).unsqueeze(0).repeat(res_mask.shape[0], 1)
@@ -2058,18 +2850,23 @@ class Interpolant_10:
 
             chain_idx,
             native_X,
-            mode='motif',
+            rgadd=1.1,
+            ss= None,
             fixed_mask=None,
             training=False,
+            sampling_method='heun',  # 'euler' or 'heun'
 
     ):
 
 
 
-        res_mask, _, trans_0, rotmats_0,rg=self._init_complex_backbone(num_batch, num_res)
+        res_mask, _, trans_0, rotmats_0,rg=self._init_complex_backbone(num_batch, num_res,rgadd)
 
         #center motif
         motif_X = native_X
+
+
+
         motif_batch = {
             'res_mask': res_mask*fixed_mask,
             'chain_idx': chain_idx,
@@ -2097,11 +2894,18 @@ class Interpolant_10:
         p = Protein.from_XCS(motif_t0, chain_idx, chain_idx, )
         p.to_PDB('motif_native_'+str('motif_t0')+'.pdb')
 
-
-        batch = {
-            'res_mask': res_mask,
-            'chain_idx': chain_idx,
-        'fixed_mask': fixed_mask}
+        if ss is not None:
+            batch = {
+                'res_mask': res_mask,
+                'chain_idx': chain_idx,
+                'fixed_mask': fixed_mask,
+                'ss': ss
+            }
+        else:
+            batch = {
+                'res_mask': res_mask,
+                'chain_idx': chain_idx,
+            'fixed_mask': fixed_mask}
 
 
 
@@ -2151,8 +2955,14 @@ class Interpolant_10:
 
             # Take reverse step
             d_t = t_2 - t_1
-            trans_t_2 = self._trans_euler_step(
-                d_t, t_1, pred_trans_1, trans_t_1)
+
+            # Choose sampling method: euler or heun
+            if sampling_method == 'heun':
+                trans_t_2 = self.heun_step_R3(
+                    d_t, t_1, pred_trans_1, trans_t_1)
+            else:  # 'euler'
+                trans_t_2 = self._trans_euler_step(
+                    d_t, t_1, pred_trans_1, trans_t_1)
 
             def _center(_X):
                 _X = _X - _X.mean(1, keepdim=True)
@@ -2162,8 +2972,12 @@ class Interpolant_10:
             if self._cfg.self_condition:
                 batch['trans_sc'] = trans_t_2
 
-            rotmats_t_2 = self._rots_euler_step(
-                d_t, t_1, pred_rotmats_1, rotmats_t_1)
+            if sampling_method == 'heun':
+                rotmats_t_2 = self.heun_step_SO3(
+                    d_t, t_1, pred_rotmats_1, rotmats_t_1)
+            else:  # 'euler'
+                rotmats_t_2 = self._rots_euler_step(
+                    d_t, t_1, pred_rotmats_1, rotmats_t_1)
 
 
             prot_traj.append((trans_t_2, rotmats_t_2))
@@ -2219,9 +3033,399 @@ class Interpolant_10:
         # print('RMSD:  ',RMSD)
         # return [atom37_traj],_
 
+    def hybrid_motif_sym_sample(
+            self,
+            num_batch,
+            num_res: list,
+            model,
+            chain_idx,
+            native_X,
+            fixed_mask=None,
+            symmetry='c3',
+            recenter=True,
+            radius=0.0,
+            rgadd=1.0,
+            ss=None,
+            sampling_method='heun',
+            save_traj_dir=None,
+            save_interval=10,
+    ):
+        """
+        Hybrid sampling with both motif scaffolding and symmetry constraints.
 
+        Args:
+            num_batch: Batch size (usually 1)
+            num_res: List of residue counts per chain [asymmetric_unit_length]
+            model: Flow model
+            chain_idx: Chain indices for asymmetric unit
+            native_X: Native backbone atoms for motif region [1, L, 4, 3]
+            fixed_mask: Mask indicating motif positions [1, L]
+            symmetry: Symmetry type ('c3', 'c4', 'd2', etc.)
+            recenter: Whether to recenter subunits
+            radius: Radius for recentering
+            rgadd: Radius of gyration multiplier
+            ss: Secondary structure constraints (optional)
+            sampling_method: 'euler' or 'heun'
+
+        Returns:
+            X: Backbone coordinates [1, L_total, 4, 3]
+            C: Chain indices [1, L_total]
+            S: Sequence placeholder [1, L_total]
+        """
+        from tqdm import tqdm
+
+        # Initialize symmetry generator
+        self.symmetry = SymGen(symmetry, recenter, radius)
+        print(f'[Motif+Sym] Using {symmetry} symmetry with order {self.symmetry.order}')
+
+        # native_X is already the FULL structure with all chains (e.g., 340 residues for 4 chains)
+        # num_res[0] is the total length (already multiplied by order)
+        full_len = num_res[0]
+        asym_len = full_len // self.symmetry.order
+        print(f'[Motif+Sym] Full structure: {full_len} residues ({asym_len} × {self.symmetry.order})')
+
+        # Extract motif frames directly from native_X
+        # native_X already contains all chains in correct symmetric positions
+        rotmats_m_full, trans_m_full, _ = self.frame_builder.inverse(native_X, chain_idx)
+
+        # Calculate overall motif center and center ALL motifs at origin
+        motif_mask_bool = fixed_mask.squeeze(0).bool()  # [L]
+        overall_motif_center = trans_m_full[:, motif_mask_bool].mean(1, keepdim=True)  # [B, 1, 3]
+        print(f'[Motif+Sym] Overall motif center: {overall_motif_center.squeeze().cpu().numpy()}')
+
+        # Center all motifs at origin
+        trans_m_full = trans_m_full - overall_motif_center
+        print(f'[Motif+Sym] All motifs centered at origin')
+
+        # Initialize each chain separately around its own motif
+        print('[Motif+Sym] Initializing each chain around its own motif...')
+        trans_0, rotmats_0 = self._init_per_chain_around_motif(
+            num_batch, chain_idx, fixed_mask, trans_m_full, rotmats_m_full, rgadd
+        )
+
+        # Create res_mask
+        res_mask = torch.ones(num_batch, full_len, device=self._device)
+
+        # S for symmetry application
+        S_expanded = torch.ones(full_len)
+
+        # Prepare diffuse mask (1 where we can modify, 0 where motif is fixed)
+        diffuse_mask = 1 - fixed_mask
+
+        # Apply motif constraints to initial state
+        # Motif regions should NOT have random noise
+        trans_0 = _trans_diffuse_mask(trans_0, trans_m_full, diffuse_mask)
+        rotmats_0 = _rots_diffuse_mask(rotmats_0, rotmats_m_full, diffuse_mask)
+        print('[Motif+Sym] Initial state: motif regions fixed, scaffold regions random')
+
+        # Setup batch
+        batch = {
+            'res_mask': res_mask,
+            'chain_idx': chain_idx,  # chain_idx is already full structure
+            'fixed_mask': None,
+            'ss': torch.zeros_like(res_mask),
+        }
+
+        # Setup time steps
+        ts = torch.linspace(self._cfg.min_t, 1.0, self._sample_cfg.num_timesteps)
+        t_1 = ts[0]
+
+        prot_traj = [(trans_0, rotmats_0)]
+        clean_traj = []
+
+        print(f'[Motif+Sym] Sampling {self._sample_cfg.num_timesteps} steps...')
+        step_idx = 0
+        # for t_2 in tqdm(ts[1:], desc='Sampling', ncols=100):
+        for t_2 in ts[1:]:
+            step_idx += 1
+            # Current state (full symmetric structure)
+            trans_t_1, rotmats_t_1 = prot_traj[-1]
+            batch['trans_t'] = trans_t_1
+            batch['rotmats_t'] = rotmats_t_1
+            bb_atoms_t = self.frame_builder(rotmats_t_1.float(), trans_t_1, chain_idx)
+            batch['bbatoms_t'] = bb_atoms_t
+
+            # # Save current state for inspection (only chainA, every 10 steps or first 3 steps)
+            # if save_traj_dir is not None and (step_idx % save_interval == 0 or step_idx <= 3):
+            #     from chroma.data.protein import Protein
+            #     # Filter to only chainA (first chain)
+            #     first_chain_id = chain_idx[0, 0]
+            #     chain_a_mask = (chain_idx[0] == first_chain_id).cpu()
+            #     X_current_full = bb_atoms_t.detach().cpu()
+            #     X_current_chainA = X_current_full[:, chain_a_mask, :, :]
+            #     C_current_chainA = chain_idx[:, chain_a_mask].cpu() + 25
+            #     S_current_chainA = torch.ones_like(C_current_chainA)
+            #     p_current = Protein.from_XCS(X_current_chainA, C_current_chainA, S_current_chainA)
+            #     current_pdb_path = os.path.join(save_traj_dir, f'current_state_step_{step_idx:04d}_chainA.pdb')
+            #     p_current.to_PDB(current_pdb_path)
+            #     if step_idx <= 3:
+            #         print(f'[Motif+Sym] Saved current chainA at step {step_idx}')
+
+            # Model prediction (on full symmetric structure)
+            t = torch.ones((num_batch, 1), device=self._device) * t_1
+            batch['t'] = t
+            with torch.no_grad():
+                model_out = model(batch, recycle=1)
+
+            pred_trans_1 = model_out['pred_trans']
+            pred_rotmats_1 = model_out['pred_rotmats']
+            clean_traj.append((pred_trans_1.detach().cpu(), pred_rotmats_1.detach().cpu()))
+
+            # Apply symmetry to model predictions (BEFORE denoising step)
+            bb_atoms_pred = self.frame_builder(pred_rotmats_1.float(), pred_trans_1, chain_idx)
+            sym_bb_atoms_pred, _ = self.symmetry.apply_symmetry(
+                bb_atoms_pred.squeeze(0).cpu(), S_expanded
+            )
+            sym_bb_atoms_pred = sym_bb_atoms_pred.to(self._device)
+            pred_rotmats_1, pred_trans_1, _ = self.frame_builder.inverse(
+                sym_bb_atoms_pred.unsqueeze(0), chain_idx
+            )
+
+            # # Save predicted structure after symmetry (only chainA, every 10 steps or first 3 steps)
+            # if save_traj_dir is not None and (step_idx % save_interval == 0 or step_idx <= 3):
+            #     from chroma.data.protein import Protein
+            #     # Filter to only chainA (first chain)
+            #     first_chain_id = chain_idx[0, 0]
+            #     chain_a_mask = (chain_idx[0] == first_chain_id).cpu()
+            #     X_pred_full = sym_bb_atoms_pred.unsqueeze(0).detach().cpu()
+            #     X_pred_chainA = X_pred_full[:, chain_a_mask, :, :]
+            #     C_pred_chainA = chain_idx[:, chain_a_mask].cpu() + 25
+            #     S_pred_chainA = torch.ones_like(C_pred_chainA)
+            #     p_pred = Protein.from_XCS(X_pred_chainA, C_pred_chainA, S_pred_chainA)
+            #     pred_pdb_path = os.path.join(save_traj_dir, f'predicted_step_{step_idx:04d}_chainA.pdb')
+            #     p_pred.to_PDB(pred_pdb_path)
+            #     if step_idx <= 3:
+            #         print(f'[Motif+Sym] Saved predicted chainA at step {step_idx}')
+
+            # Align each chain's prediction to its motif before denoising step
+            if step_idx <= 3:
+                print(f'[Motif+Sym] Step {step_idx}: Aligning predictions to motifs per chain...')
+            pred_trans_1, pred_rotmats_1 = self._align_prediction_to_motif_per_chain(
+                pred_trans_1, pred_rotmats_1, trans_t_1, rotmats_t_1, chain_idx, fixed_mask
+            )
+
+            # # Save aligned prediction (every 10 steps or first 3 steps)
+            # if save_traj_dir is not None and (step_idx % save_interval == 0 or step_idx <= 3):
+            #     from chroma.data.protein import Protein
+            #     bb_atoms_aligned = self.frame_builder(pred_rotmats_1.float(), pred_trans_1, chain_idx)
+            #     X_aligned = bb_atoms_aligned.detach().cpu()
+            #     C_aligned = chain_idx + 25
+            #     S_aligned = torch.ones_like(C_aligned)
+            #     p_aligned = Protein.from_XCS(X_aligned, C_aligned, S_aligned)
+            #     aligned_pdb_path = os.path.join(save_traj_dir, f'aligned_step_{step_idx:04d}.pdb')
+            #     p_aligned.to_PDB(aligned_pdb_path)
+            #     if step_idx <= 3:
+            #         print(f'[Motif+Sym] Saved aligned structure at step {step_idx}')
+
+            # Take denoising step (with symmetry-corrected and motif-aligned predictions)
+            d_t = t_2 - t_1
+
+            if sampling_method == 'heun':
+                trans_t_2 = self.heun_step_R3(d_t, t_1, pred_trans_1, trans_t_1)
+                rotmats_t_2 = self.heun_step_SO3(d_t, t_1, pred_rotmats_1, rotmats_t_1)
+            else:
+                trans_t_2 = self._trans_euler_step(d_t, t_1, pred_trans_1, trans_t_1)
+                rotmats_t_2 = self._rots_euler_step(d_t, t_1, pred_rotmats_1, rotmats_t_1)
+
+            # Re-apply motif constraints to ALL motif positions (via fixed_mask)
+            trans_t_2 = _trans_diffuse_mask(trans_t_2, trans_m_full, diffuse_mask)
+            rotmats_t_2 = _rots_diffuse_mask(rotmats_t_2, rotmats_m_full, diffuse_mask)
+
+            # Re-apply symmetry constraints
+            bb_atoms_pred = self.frame_builder(rotmats_t_2.float(), trans_t_2, chain_idx)
+            sym_bb_atoms_pred, _ = self.symmetry.apply_symmetry(
+                bb_atoms_pred.squeeze(0).cpu(), S_expanded
+            )
+
+            sym_bb_atoms_pred = sym_bb_atoms_pred.to(self._device)
+
+            # Convert back to frames
+            rotmats_t_2, trans_t_2, _ = self.frame_builder.inverse(
+                sym_bb_atoms_pred.unsqueeze(0), chain_idx
+            )
+
+            # Re-apply motif constraints AGAIN after symmetry (critical!)
+            # Symmetry overwrites all subunits, so we must restore ALL motif positions
+            trans_t_2 = _trans_diffuse_mask(trans_t_2, trans_m_full, diffuse_mask)
+            rotmats_t_2 = _rots_diffuse_mask(rotmats_t_2, rotmats_m_full, diffuse_mask)
+
+            # Center based on motif region (keep motif at center)
+            # motif_center_current = trans_t_2[:, motif_mask_bool].mean(1, keepdim=True)
+            # trans_t_2 = trans_t_2 - motif_center_current
+
+            if self._cfg.self_condition:
+                batch['trans_sc'] = trans_t_2
+
+            prot_traj.append((trans_t_2, rotmats_t_2))
+
+            # Save intermediate trajectory
+            if save_traj_dir is not None and step_idx % save_interval == 0:
+                from chroma.data.protein import Protein
+                bb_atoms_step = self.frame_builder(rotmats_t_2.float(), trans_t_2, chain_idx)
+
+                # Motif should already be correct due to constraint application
+                X_step = bb_atoms_step.detach().cpu()
+                C_step = chain_idx + 25
+                S_step = torch.ones_like(C_step)
+
+                p_step = Protein.from_XCS(X_step, C_step, S_step)
+                step_pdb_path = os.path.join(save_traj_dir, f'step_{step_idx:04d}.pdb')
+                p_step.to_PDB(step_pdb_path)
+
+            t_1 = t_2
+
+        # Final prediction
+        print('[Motif+Sym] Final prediction...')
+        t_1 = ts[-1]
+        trans_t_1, rotmats_t_1 = prot_traj[-1]
+        batch['trans_t'] = trans_t_1
+        batch['rotmats_t'] = rotmats_t_1
+        batch['t'] = torch.ones((num_batch, 1), device=self._device) * t_1
+
+        with torch.no_grad():
+            model_out = model(batch)
+
+        pred_trans_1 = model_out['pred_trans']
+        pred_rotmats_1 = model_out['pred_rotmats']
+
+        # Apply motif constraints to ALL motif positions
+        pred_trans_1 = _trans_diffuse_mask(pred_trans_1, trans_m_full, diffuse_mask)
+        pred_rotmats_1 = _rots_diffuse_mask(pred_rotmats_1, rotmats_m_full, diffuse_mask)
+
+        # Apply final symmetry
+        bb_atoms_final = self.frame_builder(pred_rotmats_1.float(), pred_trans_1, chain_idx)
+        sym_bb_atoms_final, sym_S_final = self.symmetry.apply_symmetry(
+            bb_atoms_final.squeeze(0).cpu(), S_expanded
+        )
+
+        # Convert back to frames and re-apply motif constraints
+        sym_bb_atoms_final = sym_bb_atoms_final.to(self._device)
+        pred_rotmats_1, pred_trans_1, _ = self.frame_builder.inverse(
+            sym_bb_atoms_final.unsqueeze(0), chain_idx
+        )
+        pred_trans_1 = _trans_diffuse_mask(pred_trans_1, trans_m_full, diffuse_mask)
+        pred_rotmats_1 = _rots_diffuse_mask(pred_rotmats_1, rotmats_m_full, diffuse_mask)
+
+        # Center based on motif region (keep motif at center)
+        motif_center_final = pred_trans_1[:, motif_mask_bool].mean(1, keepdim=True)
+        pred_trans_1 = pred_trans_1 - motif_center_final
+
+        # Rebuild final structure with motif constraints applied
+        bb_atoms_final = self.frame_builder(pred_rotmats_1.float(), pred_trans_1, chain_idx)
+
+        # Prepare output
+        X = bb_atoms_final.detach().cpu()
+        C = chain_idx + 25
+        S = torch.ones_like(C)
+
+        print(f'[Motif+Sym] Generated structure: {X.shape[1]} residues ({asym_len} × {self.symmetry.order})')
+
+        return X, C, S
 
     def hybrid_binder_sample(
+            self,
+            model,
+            batch,
+            num_steps=None,
+
+
+    ):
+        model.eval()
+        num_batch = batch['fixed_mask'].shape[0]
+        chain_idx = batch['chain_idx']
+        trans_0, rotmats_0 = batch['trans_t'], batch['rotmats_t']
+        prot_traj = [(trans_0, rotmats_0)]
+
+        # Set-up time
+        if num_steps is not None:
+            self._sample_cfg.num_timesteps = num_steps
+        ts = torch.linspace(
+            self._cfg.min_t, 1.0, self._sample_cfg.num_timesteps)
+        t_1 = ts[0]
+
+        for t_2 in tqdm(ts[1:], leave=True, desc='time step', ncols=100, dynamic_ncols=True, position=0):
+
+            trans_t_1, rotmats_t_1 = prot_traj[-1]
+            batch['trans_t'] = trans_t_1
+            batch['rotmats_t'] = rotmats_t_1
+            t = torch.ones((num_batch, 1), device=self._device) * t_1
+            batch['t'] = t
+            with torch.no_grad():
+                model_out = model(batch, recycle=1, is_training=True)
+
+            # #update side chain info
+            # batch['aatype']=model_out['SEQ']
+            # batch['atoms14_b_factors']=model_out['pred_bf']*20
+            # batch['chi']=model_out['pred_chi']
+
+            # Process model output.
+            pred_trans_1 = model_out['pred_trans']
+            pred_rotmats_1 = model_out['pred_rotmats']
+
+            # Take reverse step
+            d_t = t_2 - t_1
+
+            trans_t_2 = self._trans_euler_step(
+                d_t, t_1, pred_trans_1, trans_t_1)
+
+            def _center(_X):
+                _X = _X - _X.mean(1, keepdim=True)
+                return _X
+
+            trans_t_2 = _center(trans_t_2)
+            if self._cfg.self_condition:
+                batch['trans_sc'] = trans_t_2
+
+            rotmats_t_2 = self._rots_euler_step(
+                d_t, t_1, pred_rotmats_1, rotmats_t_1)
+
+            prot_traj.append((trans_t_2, rotmats_t_2))
+            t_1 = t_2
+
+            # ###########################
+            atoms4 = self.frame_builder(rotmats_t_2.float(), trans_t_2, chain_idx)
+            # X = atoms4.detach().cpu()
+            # C = chain_idx.detach().cpu()
+            # S = model_out['SEQ'].detach().cpu()
+            # #
+            # bf = model_out['pred_bf'] * 20
+            # p = Protein.from_XCSB(X, C, S, bf)
+            # # 获取当前使用的全局seed
+            # current_seed = get_global_seed()
+            # seed_prefix = f"{current_seed}_" if current_seed is not None else ""
+            #
+            # saved_path = f"{seed_prefix}{t.detach().cpu().item()}_binder_sample.pdb"
+            # p.to_PDB(saved_path)
+
+        # We only integrated to min_t, so need to make a final step
+        t_1 = ts[-1]
+        trans_t_1, rotmats_t_1 = prot_traj[-1]
+        batch['trans_t'] = trans_t_1
+        batch['rotmats_t'] = rotmats_t_1
+        batch['bbatoms_t'] = self.frame_builder(rotmats_t_1.float(), trans_t_1, chain_idx)
+
+        batch['t'] = torch.ones((num_batch, 1), device=self._device) * t_1
+        with torch.no_grad():
+            model_out = model(batch)
+        pred_trans_1 = model_out['pred_trans']
+        pred_rotmats_1 = model_out['pred_rotmats']
+
+        prot_traj.append((pred_trans_1, pred_rotmats_1))
+
+        # Convert trajectories to atom37.
+        # atom37_traj = all_atom.transrot_to_atom37(prot_traj, res_mask)
+        atom37_traj = self.frame_builder(pred_rotmats_1, pred_trans_1, chain_idx).detach().cpu()
+
+        # return [atom37_traj],None
+
+        X = atom37_traj.detach().cpu()
+        C = chain_idx.detach().cpu()
+        S = model_out['SEQ'].detach().cpu()
+        bf = model_out['pred_bf'] * 20
+
+        return X, C, S, bf
+
+    def hybrid_DYN_binder_sample(
             self,
             model,
             batch,
@@ -2245,6 +3449,11 @@ class Interpolant_10:
 
             trans_t_1, rotmats_t_1 = prot_traj[-1]
             batch['trans_t'] = trans_t_1
+
+            tx1=trans_t_1[0]
+            tx2 = trans_t_1[1]
+            tx0=tx1-tx2
+
             batch['rotmats_t'] = rotmats_t_1
             t = torch.ones((num_batch, 1), device=self._device) * t_1
             batch['t'] = t
@@ -2258,7 +3467,16 @@ class Interpolant_10:
 
             # Process model output.
             pred_trans_1 = model_out['pred_trans']
+
+            pred_trans_1_average = maskwise_avg_replace(model_out['pred_trans'], batch['fixed_mask'])
+            x1=model_out['pred_trans'][0]
+            x2 = model_out['pred_trans'][1]
+            x0=x1-x2
+
             pred_rotmats_1 = model_out['pred_rotmats']
+
+            pred_rotmats_1_average=parallel_karcher_mean(model_out['pred_rotmats'], batch['fixed_mask'])
+
 
 
             # Take reverse step
@@ -2310,6 +3528,9 @@ class Interpolant_10:
             model_out = model(batch)
         pred_trans_1 = model_out['pred_trans']
         pred_rotmats_1 = model_out['pred_rotmats']
+
+        pred_trans_1_average = maskwise_avg_replace(model_out['pred_trans'], batch['fixed_mask'])
+        pred_rotmats_1_average = parallel_karcher_mean(model_out['pred_rotmats'], batch['fixed_mask'])
 
         prot_traj.append((pred_trans_1, pred_rotmats_1))
 

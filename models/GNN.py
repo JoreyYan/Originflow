@@ -380,9 +380,9 @@ class EncoderLayer(nn.Module):
             update_mask = mask_i[..., None]
 
         node_rigid_update = self.bb_update(
-            node_embed * update_mask)  # B,N 6
+            node_embed* update_mask)  # B,N 6
         R = R.compose_q_update_vec(
-                node_rigid_update, update_mask)
+                node_rigid_update,update_mask)
 
         return node_embed,R
 

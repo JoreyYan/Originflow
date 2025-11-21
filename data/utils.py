@@ -12,7 +12,7 @@ from Bio.PDB.Chain import Chain
 from data import protein
 import dataclasses
 from Bio import PDB
-
+from typing import Optional
 Rigid = ru.Rigid
 Protein = protein.Protein
 
@@ -450,3 +450,74 @@ def process_chain(chain: Chain, chain_id: str) -> Protein:
         residue_index=np.array(residue_index),
         chain_index=np.array(chain_ids),
         b_factors=np.array(b_factors))
+def align_pred_to_true(
+    pred_pose: torch.Tensor,
+    true_pose: torch.Tensor,
+    atom_mask: Optional[torch.Tensor] = None,
+    weight: Optional[torch.Tensor] = None,
+    allowing_reflection: bool = False,
+):
+    """Find optimal transformation, rotation (and reflection) of two poses.
+    Arguments:
+        pred_pose: [...,N,3] the pose to perform transformation on
+        true_pose: [...,N,3] the target pose to align pred_pose to
+        atom_mask: [..., N] a mask for atoms
+        weight: [..., N] a weight vector to be applied.
+        allow_reflection: whether to allow reflection when finding optimal alignment
+    return:
+        aligned_pose: [...,N,3] the transformed pose
+        rot: optimal rotation
+        translate: optimal translation
+    """
+    if atom_mask is not None:
+        pred_pose = pred_pose * atom_mask.unsqueeze(-1)
+        true_pose = true_pose * atom_mask.unsqueeze(-1)
+    else:
+        atom_mask = torch.ones(*pred_pose.shape[:-1]).to(pred_pose.device)
+
+    if weight is None:
+        weight = atom_mask
+    else:
+        weight = weight * atom_mask
+
+    weighted_n_atoms = torch.sum(weight, dim=-1, keepdim=True).unsqueeze(-1)
+    pred_pose_centroid = (
+        torch.sum(pred_pose * weight.unsqueeze(-1), dim=-2, keepdim=True)
+        / weighted_n_atoms
+    )
+    pred_pose_centered = pred_pose - pred_pose_centroid
+    true_pose_centroid = (
+        torch.sum(true_pose * weight.unsqueeze(-1), dim=-2, keepdim=True)
+        / weighted_n_atoms
+    )
+    true_pose_centered = true_pose - true_pose_centroid
+    H_mat = torch.matmul(
+        (pred_pose_centered * weight.unsqueeze(-1)).transpose(-2, -1),
+        true_pose_centered * atom_mask.unsqueeze(-1),
+    )
+    u, s, v = torch.svd(H_mat)
+    u = u.transpose(-1, -2)
+
+    if not allowing_reflection:
+
+        det = torch.linalg.det(torch.matmul(v, u))
+
+        diagonal = torch.stack(
+            [torch.ones_like(det), torch.ones_like(det), det], dim=-1
+        )
+        rot = torch.matmul(
+            torch.diag_embed(diagonal).to(u.device),
+            u,
+        )
+        rot = torch.matmul(v, rot)
+    else:
+        rot = torch.matmul(v, u)
+    translate = true_pose_centroid - torch.matmul(
+        pred_pose_centroid, rot.transpose(-1, -2)
+    )
+
+    pred_pose_translated = (
+        torch.matmul(pred_pose_centered, rot.transpose(-1, -2)) + true_pose_centroid
+    )
+
+    return pred_pose_translated, rot, translate

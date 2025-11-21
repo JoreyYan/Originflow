@@ -616,13 +616,13 @@ class FlowModel(nn.Module):
         # try mixed feature
         # new features
         from chroma.data.protein import Protein
-        t_value = input_feats.get('t', torch.tensor([[0.0]])).detach().cpu().item()
+
         curr_rigids_cp = self.rigids_nm_to_ang(curr_rigids)
         trans_t_2 = curr_rigids_cp.get_trans()
         rotmats_t_2 = curr_rigids_cp.get_rots().get_rot_mats()
         atoms4 = self.frame_builder(rotmats_t_2.float(), trans_t_2, chain_idx)
-        p = Protein.from_XCS(atoms4.detach().cpu(), chain_idx.detach().cpu(), chain_idx.detach().cpu(), )
-        p.to_PDB('/home/junyu/project/Proflow/unmidout/' + str('test_') +str(t_value)+ '.pdb')
+       # p = Protein.from_XCS(atoms4.detach().cpu(), chain_idx.detach().cpu(), chain_idx.detach().cpu(), )
+        # p.to_PDB('/home/junyu/project/Proflow/unmidout/' + str('test_') +str(t_value)+ '.pdb')
 
 
         node_embed=node_embed#+node_init_embed  #
@@ -656,7 +656,7 @@ class FlowModel(nn.Module):
       
         atoms4 = self.frame_builder(pred_rotmats.float(), pred_trans, chain_idx)
         p = Protein.from_XCS(atoms4.detach().cpu(), chain_idx.detach().cpu(), chain_idx.detach().cpu(), )
-        p.to_PDB('/home/junyu/project/Proflow/unout/' + str('test_') +str(t_value) +'.pdb')
+        # p.to_PDB('/home/junyu/project/Proflow/unout/' + str('test_') +str(t_value) +'.pdb')
 
 
         return {

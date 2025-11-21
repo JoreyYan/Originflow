@@ -1,0 +1,71 @@
+# Configuration for inference on SE(3) diffusion experiments.
+defaults:
+  - binder
+  - _self_
+
+inference:
+
+  # Use this to write with date-time stamp.
+  lam:
+  name: rcsb
+  seed:
+  ckpt_path: ../weight/binder/binder.ckpt
+  output_dir: inference_outputs/
+
+  use_gpu: True
+  num_gpus: 1
+
+  # 采样方法选择: "hotspot", "reference", 或 "basic"
+  sampling_method: "hotspot"
+
+  # 通用参数
+  target_com_idx: [5]  # 设计目标的com_idx列表
+  min_length: 25          # 最小序列长度
+  max_length: 100         # 最大序列长度
+  num_samples: 10        # 样本数量
+  
+  # sample_binder_bylength_hotspot 参数
+  hotspot: ['R310','R241','R99']  # 热点残基列表,'R42'
+  fixed_by_chain: [18]    # 固定的链ID
+  design_class_name: "gcpr"  # 设计类名称
+  base_path: "/home/junyu/project/binder_target/gcpr/preprocessed"  # 基础路径
+  ref_path: "/home/junyu/project/binder_target/gcpr/preprocessed/reference.pkl"  # 参考文件路径
+  
+  # sample_binder_bylength_reference 参数
+  fixed_com_idx: [6]      # 固定的com_idx
+
+  interpolant:
+    min_t: 1e-3
+    temp: ${inference.lam}
+    rots:
+      corrupt: True
+      sample_schedule: exp
+      exp_rate: 10
+    trans:
+      corrupt: True
+      sample_schedule: linear
+    sampling:
+      num_timesteps: 1000
+    self_condition: True
+
+  samples:
+    # Number of backbone samples per sequence length.
+    samples_per_length: 2
+
+    # Minimum sequence length to sample.
+    min_length: 100
+
+    # Maximum sequence length to sample.
+    max_length: 150
+
+    # gap between lengths to sample. i.e. this script will sample all lengths
+    # in range(min_length, max_length, length_step)
+    length_step: 10
+
+    # Subset of lengths to sample. If null, sample all targets.
+    length_subset: null
+
+    overwrite: False
+
+    output_dir: /home/junyu/project/binder_target/gpcr/preprocessed/
+

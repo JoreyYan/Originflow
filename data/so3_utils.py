@@ -508,7 +508,10 @@ def geodesic_t(t: float, mat: torch.Tensor, base_mat: torch.Tensor, rot_vf=None)
     """
     if rot_vf is None:
         rot_vf = calc_rot_vf(base_mat, mat)
+
+
     mat_t = rotvec_to_rotmat(t * rot_vf)
+
     if base_mat.shape != mat_t.shape:
         raise ValueError(
             f'Incompatible shapes: base_mat={base_mat.shape}, mat_t={mat_t.shape}')
@@ -1373,3 +1376,145 @@ def generate_dlog_igso3_lookup_table(
         tol=tol,
     )
     return dlog_igso
+
+
+# 直接使用你已有的 so3_utils 中的函数：
+# calc_rot_vf, rotvec_to_rotmat, rot_mult, dlog_igso3_expansion
+
+
+
+
+def so3_pf_ode_step(
+    R_t: torch.Tensor,          # [..., 3, 3]
+    R_1: torch.Tensor,          # [..., 3, 3]
+    t: torch.Tensor,            # 1 -> 0
+    dt: torch.Tensor,           # < 0
+    exp_rate: float,            # exp日程常数
+    sigma_t: torch.Tensor = None,  # 未使用（你现在用的是 sigma2 = k0 + k1*g2）
+    temp: float = 1.0,
+    use_score: bool = False,
+    eps: float = 1e-6,
+):
+    # geodesic 切向量
+    xi = calc_rot_vf(R_t, R_1)                      # [...,3]
+    f  = exp_rate * xi                               # 主项（与训练一致）
+
+    if use_score:
+        t_safe = t.clamp(min=eps, max=1.0 - eps)
+
+        # 单位切向量
+        omega = torch.norm(xi, dim=-1, keepdim=True)  # [...,1]
+        u = xi / omega.clamp_min(1e-8)                # [...,3]
+        w = omega.squeeze(-1)                         # [...]
+
+        # ---- g^2(t)：温和有界（你现在生效的版本）----
+        t0 = 0.05
+        g2 = 2.0 * (1.0 - t_safe) / (t_safe + t0)     # 代替 (2-2t)/t，末端不发散
+
+        # ---- IGSO(3) 小角项用 g2 配平（你现在生效的版本）----
+        k0, k1 = 1e-3, 0.2
+        sigma2 = k0 + k1 * g2                         # 不直接用传入 sigma_t
+        dlog_iso = - w / sigma2
+
+        # ---- 测度项：有界版本 + 随 t 门控（你现在生效的版本）----
+        w0 = 0.1
+        dlog_uniform = 2.0 * w / (w * w + w0 * w0)    # 有界近似，防 w->0 发散
+        lam_u = t_safe                                # 小 t 时弱化测度项
+        dlog_total = dlog_iso + lam_u * dlog_uniform
+        dlog_total = torch.clamp(dlog_total, -50.0, 50.0)  # 极端保护
+        score_tangent = dlog_total[..., None] * u
+
+        # ---- 组合 + 信任域比例（防 score 掩盖主项）----
+        score_contrib = 0.5 * g2[..., None] * score_tangent * temp
+
+        c = 0.5  # 你现在的经验默认：score 不超过主项 50%
+        f_norm = torch.norm(f, dim=-1, keepdim=True) + 1e-8
+        s_norm = torch.norm(score_contrib, dim=-1, keepdim=True) + 1e-8
+        scale = torch.clamp(c * f_norm / s_norm, max=1.0)
+        score_contrib = score_contrib * scale
+
+        omega_step = f + score_contrib               # t:1->0 用 “+”
+    else:
+        omega_step = f
+
+    # 步长：与 geodesic 对齐
+    dR = rotvec_to_rotmat(omega_step * dt[..., None])
+    R_next = rot_mult(R_t, dR)
+
+    return R_next,omega_step
+
+def project_to_so3_fast(R: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    # R: [...,3,3]
+    orig_dtype = R.dtype
+    X = R.to(torch.float32)
+
+    a = X[..., :, 0]
+    b = X[..., :, 1]
+    an = torch.linalg.norm(a, dim=-1, keepdim=True).clamp_min(eps)
+    u = a / an
+
+    ub = (u * b).sum(dim=-1, keepdim=True)
+    b_orth = b - ub * u
+    bn = torch.linalg.norm(b_orth, dim=-1, keepdim=True).clamp_min(eps)
+    v = b_orth / bn
+
+    w = torch.cross(u, v, dim=-1)
+    R_proj = torch.stack([u, v, w], dim=-1)
+
+    det = torch.linalg.det(R_proj)
+    R_proj = torch.where(det[..., None, None] < 0,
+                         torch.stack([u, v, -w], dim=-1),
+                         R_proj)
+    return R_proj.to(orig_dtype)
+
+def so3_omega_drift_time(
+    R_t: torch.Tensor,          # [..., 3, 3]
+    R_1: torch.Tensor,          # [..., 3, 3]
+    t: torch.Tensor,            # 1 -> 0
+    exp_rate: float,            # exp日程常数
+    sigma_t: torch.Tensor,      # <<< 只随时间的 σ(t)
+    temp: float = 1.0,
+    eps: float = 1e-6,
+    g2_cap: float = 40.0,       # 防小t爆：给 g^2(t) 上限
+    w0: float = 0.1,            # 有界测度项 2w/(w^2+w0^2) 的平滑半径
+    gate_measure_by_t: bool = True,  # 测度项随 t 门控
+):
+    """
+    返回 SO(3) 的角速度漂移 omega_step(R_t, t)。不做更新、不依赖 dt。
+    σ 仅由“时间”决定（与训练 schedule 对齐），其余是数值稳化护栏。
+    """
+    # geodesic 切向量与主项
+    xi = calc_rot_vf(R_t, R_1)                       # [...,3]
+    f  = exp_rate * xi
+
+    # 安全/几何量
+    t_safe = t.clamp(min=eps, max=1.0 - eps)
+    omega = torch.norm(xi, dim=-1, keepdim=True)     # [...,1]
+    u = xi / omega.clamp_min(1e-8)                   # [...,3]
+    w = omega.squeeze(-1)                            # [...]
+
+    # g^2(t)（与σ无关；作为SDE/PF-ODE家族的时间日程；小t处加上限）
+    g2 = (2.0 - 2.0 * t_safe) / t_safe               # 原配方
+    if g2_cap is not None:
+        g2 = torch.clamp(g2, max=g2_cap)
+
+    # σ(t)：仅随时间（与训练一致）
+    sigma2 = (sigma_t.to(t_safe.dtype) ** 2).clamp_min(1e-8)
+
+    # score 的角度项：d/dw log p(ω;σ(t)) ≈ - w / σ(t)^2
+    dlog_iso = - w / sigma2
+
+    # 测度项：有界近似 + 可选随 t 的门控（防 w→0 与小t爆）
+    dlog_uniform = 2.0 * w / (w * w + w0 * w0)
+    if gate_measure_by_t:
+        dlog_uniform = t_safe * dlog_uniform
+
+    dlog_total = dlog_iso + dlog_uniform
+    dlog_total = torch.clamp(dlog_total, -50.0, 50.0)       # 极端保护
+    score_tangent = dlog_total[..., None] * u                # [...,3]
+
+    # PF-ODE 合成（t:1->0，用 “+” 号）
+    omega_step = f + 0.5 * g2[..., None] * score_tangent * temp
+
+    return omega_step
+

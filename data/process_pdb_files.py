@@ -23,7 +23,7 @@ parser = argparse.ArgumentParser(
 parser.add_argument(
     '--pdb_dir',
     help='Path to directory with PDB files.',
-    default='//home/junyu/project/binder_target/1bj1/',
+    default='/home/junyu/project/Proflow/examples/sym_motif/nikel_4chains/',
     type=str)
 parser.add_argument(
     '--num_processes',
@@ -43,14 +43,19 @@ parser.add_argument(
     '--verbose',
     help='Whether to log everything.',
     action='store_true')
+parser.add_argument(
+    '--output_ss',default=True,
+    help='Whether to output SS sequence to ref_ss.txt.',
+    action='store_true')
 
 
-def process_file(file_path: str, write_dir: str):
+def process_file(file_path: str, write_dir: str, output_ss: bool = False):
     """Processes protein file into usable, smaller pickles.
 
     Args:
         file_path: Path to file to read.
         write_dir: Directory to write pickles to.
+        output_ss: Whether to output SS sequence to ref_ss.txt.
 
     Returns:
         Saves processed protein to pickle and returns metadata.
@@ -174,6 +179,30 @@ def process_file(file_path: str, write_dir: str):
     # Write features to pickles.
     du.write_pkl(processed_path, complex_feats)
 
+    # Output SS sequence to txt file if requested
+    if output_ss:
+        from data.residue_constants import restypes
+        ss_txt_path = os.path.join(write_dir, f'{pdb_name}_ref_ss.txt')
+
+        # Convert aatype to sequence
+        complex_aatype = complex_feats['aatype']
+        modeled_idx = complex_feats['modeled_idx']
+
+        # Get modeled residues only
+        modeled_aatype = complex_aatype[modeled_idx]
+        modeled_ss = pdb_ss[0][modeled_idx]
+
+        # Convert aatype numbers to letters
+        sequence = ''.join([restypes[aa] if aa < 20 else 'X' for aa in modeled_aatype])
+        ss_sequence = ''.join(modeled_ss)
+
+        # Write to file in FASTA-like format
+        with open(ss_txt_path, 'w') as f:
+            f.write(f'>{pdb_name}_sequence\n')
+            f.write(f'{sequence}\n')
+            f.write(f'>{pdb_name}_secondary_structure\n')
+            f.write(f'{ss_sequence}\n')
+
     # Return metadata
     return metadata
 
@@ -264,14 +293,15 @@ def process_genpdb(file_path: str, write_dir: str):
     # Return metadata
     return metadata,complex_feats
 
-def process_serially(all_paths, write_dir):
+def process_serially(all_paths, write_dir, output_ss=False):
     all_metadata = []
     for i, file_path in enumerate(all_paths):
         try:
             start_time = time.time()
             metadata = process_file(
                 file_path,
-                write_dir)
+                write_dir,
+                output_ss=output_ss)
             elapsed_time = time.time() - start_time
             print(f'Finished {file_path} in {elapsed_time:2.2f}s')
             all_metadata.append(metadata)
@@ -283,12 +313,14 @@ def process_serially(all_paths, write_dir):
 def process_fn(
         file_path,
         verbose=None,
-        write_dir=None):
+        write_dir=None,
+        output_ss=False):
     try:
         start_time = time.time()
         metadata = process_file(
             file_path,
-            write_dir)
+            write_dir,
+            output_ss=output_ss)
         elapsed_time = time.time() - start_time
         if verbose:
             print(f'Finished {file_path} in {elapsed_time:2.2f}s')
@@ -318,12 +350,14 @@ def main(args):
     if args.num_processes == 1 or args.debug:
         all_metadata = process_serially(
             all_file_paths,
-            write_dir)
+            write_dir,
+            output_ss=args.output_ss)
     else:
         _process_fn = fn.partial(
             process_fn,
             verbose=args.verbose,
-            write_dir=write_dir)
+            write_dir=write_dir,
+            output_ss=args.output_ss)
         with mp.Pool(processes=args.num_processes) as pool:
             all_metadata = pool.map(_process_fn, all_file_paths)
         all_metadata = [x for x in all_metadata if x is not None]

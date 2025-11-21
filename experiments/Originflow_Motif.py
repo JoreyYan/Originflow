@@ -87,7 +87,7 @@ class Sampler:
             accelerator="gpu",
             strategy="ddp",
             devices=devices,
-            precision=32,
+            precision='16-mixed',
         )
 
         # trainer.predict(self._flow_module, dataloaders=dataloader)
@@ -128,7 +128,7 @@ class Sampler:
             np.savetxt(os.path.join(self._flow_module._output_dir+ '/motif_masks/', f'{domain}_motif_native_mask.npy'), indices_mask)
 
 
-            for i in tqdm.tqdm(range(1)):
+            for i in tqdm.tqdm(range(10)):
                 # total_length = self.get_total_length(total_lengths)
                 sampler = MotifSamplerMultiChain(input_str)
                 results = sampler.get_results()
@@ -167,7 +167,7 @@ class Sampler:
 
                 # fixed_mask = fixed_mask.unsqueeze(0)[:, C_position].squeeze(0)
 
-                #p.to_PDB(os.path.join(self._flow_module._output_dir, f'{domain}_motif_{i}.pdb'))
+                p.to_PDB(os.path.join(self._flow_module._output_dir, f'{domain}_motif_{i}.pdb'))
                 np.savetxt(os.path.join(self._flow_module._output_dir+ '/motif_masks/', f'{domain}_motif_{i}_mask.npy'),
                            fixed_mask.cpu().numpy())
                 np.savetxt(os.path.join(self._flow_module._output_dir+ '/motif_masks/', f'{domain}_motif_{i}_Chain_mask.npy'),
@@ -187,7 +187,7 @@ def run(cfg: DictConfig) -> None:
         sampler = Sampler(cfg)
 
         # Read ref_pdb and input_str from CSV
-        csv_path = "../examples/motif_middle.csv"
+        csv_path = "../examples/motif_PDB_Input_Data.csv"
         pkl_folder_path = "../examples/rf_pdb_pkl/"
         df = pd.read_csv(csv_path)
         pdb_input_list = df[['Name', 'Input', 'TotalLength']].values.tolist()

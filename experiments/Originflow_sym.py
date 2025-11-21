@@ -117,7 +117,7 @@ def run_ss(cfg: DictConfig) -> None:
 @hydra.main(version_base=None, config_path="../configs", config_name="inference_sym")
 def run(cfg: DictConfig) -> None:
 
-    syms=['c3']
+    syms=['C3']
 
     for sym in syms:
         cfg.inference.sym=sym

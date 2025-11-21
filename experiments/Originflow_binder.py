@@ -13,9 +13,11 @@ from data.pdb_dataloader import sPdbDataset
 import numpy as np
 import random
 import datetime
-from utils import set_global_seed
-
+from utils import set_global_seed,save_cfg
+from data.utils import batch_align_structures,align_pred_to_true
 from data.pdb_dataloader import calculate_interface_residues_vtarget
+
+
 
 class Proflow(nn.Module):
 
@@ -54,6 +56,7 @@ class Proflow(nn.Module):
 
         self._model.eval()
         self.Proflow = Interpolant_10(cfg.interpolant)
+        self.sample_step=cfg.interpolant.sampling.num_timesteps
 
     def _load_from_state_dict(self, ) -> None:
         print('load from state dict')
@@ -593,7 +596,7 @@ class Proflow(nn.Module):
         if ref_path is None:
             ref_path = self._inf_cfg.ref_path
 
-        model_name = self._inf_cfg.ckpt_path.split('/')[-3]
+        model_name = self._inf_cfg.ckpt_path.split('/')[-2]
 
         # 检查文件是否存在
         if os.path.exists(ref_path):
@@ -603,7 +606,7 @@ class Proflow(nn.Module):
             from data.collect_pkl import colletdata
             ref_path = colletdata()
 
-        folder_path = design_path + model_name + '_bylen_pdbbind_' + '/'
+        folder_path = design_path + model_name + '_byreference_' + '/'
         # 检查文件夹是否存在
         if not os.path.exists(folder_path):
             # 如果文件夹不存在，则创建文件夹
@@ -838,26 +841,26 @@ class Proflow(nn.Module):
 
 
 
-    def sample_binder_bylength_hotspot(self,Target=[1],design_num=1,Length=30,hotspot=[],fixed_by_chain=None,design_class_name = '1bj1',        base_path = '/home/junyu/project/binder_target/1bj1/preprocessed',        ref_path = '/home/junyu/project/binder_target/1bj1/preprocessed/reference.pkl'):
+    def sample_binder_bylength_hotspot(self,Target=[1],design_num=1,Length=30,hotspot=[],fixed_by_chain=None,design_class_name = 'gpcr',        base_path =None,        ref_path = None):
         '''
         根据指定的目标和热点残基生成binder序列。
 
         Args:
-            Target (list): 设计目标的com_idx列表，指定需要被重新设计的复合物索引
+            Target (list): 设计目标的com_idx列表，binder  指定需要被重新设计的复合物索引,   如果原来的PDB 只有一条靶点链条，则随便指定一个与靶点不重复的com值
             design_num (int): 设计序列的数量
             Length (int): 期望的序列长度
             hotspot (list): 热点残基列表，用于指定重要的相互作用位点
             fixed_by_chain (list, optional): 用于进一步控制设计目标。当一个com_idx包含多条链时，
                                            可以通过此参数指定只针对特定的链进行设计。
                                            例如：com_idx=1包含chain_idx=[1,2,3]，
-                                           如果fixed_by_chain=[2]，则只会对chain_idx=2的部分进行设计，
+                                           如果fixed_by_chain=[2]，则只会对chain_idx=2的部分进行设计(as target)，
                                            其他链即使在同一个com_idx中也会保持不变。
                                            默认为None，表示对指定com_idx的所有链都进行设计。
 
         Returns:
             生成的binder序列和相关信息，结果会保存为PDB文件
         '''
-        model_name=self._inf_cfg.ckpt_path.split('/')[-3]
+        model_name=self._inf_cfg.ckpt_path.split('/')[-2]
 
 
 
@@ -865,7 +868,7 @@ class Proflow(nn.Module):
         # Determine folder based on parameters
         folder_suffix = '_'
         if len(hotspot) > 0:
-            folder_suffix += '_with_hotspot'
+            folder_suffix += f'hotspot_{"".join(map(str, hotspot))}'
         else:
             folder_suffix += '_no_hotspot'
             
@@ -873,7 +876,9 @@ class Proflow(nn.Module):
             folder_suffix += f'_fixed_chain_{",".join(map(str, fixed_by_chain))}'
         else:
             folder_suffix += '_only_com_idx'
-            
+
+
+        folder_suffix=folder_suffix+'_'+str(self.sample_step)+'s'
         design_path = os.path.join(base_path, folder_suffix)
         if not os.path.exists(design_path):
             os.makedirs(design_path)
@@ -888,7 +893,7 @@ class Proflow(nn.Module):
             from data.collect_pkl import colletdata
             ref_path=colletdata()
 
-        folder_path = os.path.join(design_path, f'{model_name}_by_sample_binder_bylength_hotspot_from90/')
+        folder_path = os.path.join(design_path, f'{model_name}_/')
         if not os.path.exists(folder_path):
             # 如果文件夹不存在，则创建文件夹
             os.makedirs(folder_path)
@@ -980,7 +985,7 @@ class Proflow(nn.Module):
             if hotspot:
                 center_of_mass, centered_atoms14=self.compute_center_of_mass(hotspot, new_batch['chain_idx'][0], new_batch['res_idx'][0], new_batch['atoms14'][0])
                 new_batch['atoms14']=centered_atoms14.unsqueeze(0)
-                noisy_batch = self.Proflow.corrupt_batch_binder(new_batch, 'fp32', fixed_mask,design_num,t=0,design=True ,path=design_path ,hotspot=True )
+                noisy_batch = self.Proflow.corrupt_batch_binder(new_batch, '16-mixed', fixed_mask,design_num,t=0,design=True ,path=design_path ,hotspot=True )
             else:
 
                 noisy_batch = self.Proflow.corrupt_batch_binder(new_batch, 'fp32', fixed_mask,design_num,t=0,design=True ,path=design_path ,hotspot=False )
@@ -989,7 +994,8 @@ class Proflow(nn.Module):
             samples = self.Proflow.hybrid_binder_sample(
                 self._model,
                 noisy_batch,
-                num_steps=1000,
+                num_steps=self.sample_step,
+
 
              )
             X=samples[0]
@@ -1001,8 +1007,294 @@ class Proflow(nn.Module):
             p = Protein.from_XCSB(X, C, S, BF)
             p.to_PDB(folder_path
             +design_name+'_'+str(design_num)+'_design.pdb')
+        return folder_path
+
+    def sample_DYNbinder_bylength_hotspot(self, Target=[1], design_num=1, Length=30, hotspot=[], fixed_by_chain=None,
+                                       design_class_name='gpcr',
+                                       base_path='/home/junyu/project/binder_target/1bj1/preprocessed',
+                                       ref_path='/home/junyu/project/binder_target/1bj1/preprocessed/reference.pkl',
+                                          add_path='/home/junyu/project/binder_target/1bj1/preprocessed/reference.pkl',
+                                          add_target=None,
+                                          add_fixed_by_chain=None):
+        '''
+        根据指定的目标和热点残基生成binder序列。
+
+        Args:
+            Target (list): 设计目标的com_idx列表，指定需要被重新设计的复合物索引
+            design_num (int): 设计序列的数量
+            Length (int): 期望的序列长度
+            hotspot (list): 热点残基列表，用于指定重要的相互作用位点
+            fixed_by_chain (list, optional): 用于进一步控制设计目标。当一个com_idx包含多条链时，
+                                           可以通过此参数指定只针对特定的链进行设计。
+                                           例如：com_idx=1包含chain_idx=[1,2,3]，
+                                           如果fixed_by_chain=[2]，则只会对chain_idx=2的部分进行设计，
+                                           其他链即使在同一个com_idx中也会保持不变。
+                                           默认为None，表示对指定com_idx的所有链都进行设计。
+
+        Returns:
+            生成的binder序列和相关信息，结果会保存为PDB文件
+        '''
+        model_name = self._inf_cfg.ckpt_path.split('/')[-2]
+
+        # Determine folder based on parameters
+        folder_suffix = '_'
+        if len(hotspot) > 0:
+            folder_suffix += '_with_addhotspot'
+        else:
+            folder_suffix += '_no_hotspot'
+
+        if fixed_by_chain is not None:
+            folder_suffix += f'_fixed_chain_{",".join(map(str, fixed_by_chain))}'
+        else:
+            folder_suffix += '_only_com_idx'
+
+        design_path = os.path.join(base_path, folder_suffix)
+        if not os.path.exists(design_path):
+            os.makedirs(design_path)
+
+        # 检查文件是否存在
+        if os.path.exists(ref_path):
+            # 如果文件存在，执行的操作
+            print("文件存在。")
+        else:
+            from data.collect_pkl import colletdata
+            ref_path = colletdata()
+
+        folder_path = os.path.join(design_path, f'{model_name}_by_sample_binder_bylength_hotspot_from90/')
+        if not os.path.exists(folder_path):
+            # 如果文件夹不存在，则创建文件夹
+            os.makedirs(folder_path)
+
+        PdbDataset = sPdbDataset(ref_path, is_training=False)
+
+        for i in range(len(PdbDataset)):  # PdbDataset:
+            design_name = design_class_name + '_'  # +str(native[i])
+            ref_data = PdbDataset[i]
+            # ref_data = du.read_pkl(ref_pdb)
+            # 为每个Tensor增加一个空白维度
+            ref_data = {
+                key: torch.tensor(value).unsqueeze(0).to(self.device)
+                if isinstance(value, np.ndarray) else value.unsqueeze(0).to(self.device)
+                for key, value in ref_data.items()
+            }
+
+            com_idx = ref_data['com_idx']
+            Target = torch.tensor(Target, device=com_idx.device)
+            fixed_mask = ~torch.isin(com_idx, Target)
+
+            if fixed_by_chain is not None:
+                chain_target = torch.tensor(fixed_by_chain, device=com_idx.device)
+                fixed_chain = torch.isin(ref_data['chain_idx'], chain_target)
+
+                fixed_mask = fixed_mask & fixed_chain
+
+            # make new com_idx
+            desgin_comidx = Target[0]
+            binder_com_idx = torch.ones(size=(com_idx.shape[0], Length),
+                                        device=com_idx[fixed_mask].device) * desgin_comidx
+
+            new_com_idx = torch.cat([com_idx[fixed_mask][None, :], binder_com_idx], dim=-1)
+
+            if (~fixed_mask).sum() == 0:
+                target_chain = 2
+            else:
+                target_chain = list(set(ref_data['chain_idx'][~fixed_mask].tolist()))[0]
+
+            new_batch = {
+                'atoms14': torch.cat([ref_data['atoms14'][fixed_mask][None, :], torch.rand(size=(
+                ref_data['atoms14'].shape[0], Length, ref_data['atoms14'].shape[2], ref_data['atoms14'].shape[3]),
+                                                                                           device=self.device)], dim=1),
+                'atoms14_b_factors': torch.cat([ref_data['atoms14_b_factors'][fixed_mask][None, :], torch.rand(size=(
+                    ref_data['atoms14_b_factors'].shape[0], Length, ref_data['atoms14_b_factors'].shape[2]),
+                    device=self.device)],
+                                               dim=1),
+                'chi': torch.cat([ref_data['chi'][fixed_mask][None, :], torch.ones(size=(
+                    ref_data['chi'].shape[0], Length, ref_data['chi'].shape[2]), device=self.device)],
+                                 dim=1),
+
+                'mask_chi': torch.cat([ref_data['mask_chi'][fixed_mask][None, :], torch.zeros(size=(
+                    ref_data['mask_chi'].shape[0], Length, ref_data['mask_chi'].shape[2]), device=self.device)],
+                                      dim=1),
+
+                'chain_idx': torch.cat([ref_data['chain_idx'][fixed_mask][None, :], target_chain * torch.ones(size=(
+                    ref_data['chain_idx'].shape[0], Length), device=self.device)],
+                                       dim=1),
+
+                'aatype': torch.cat([ref_data['aatype'][fixed_mask][None, :], 20 * torch.ones(size=(
+                    ref_data['aatype'].shape[0], Length), device=self.device, dtype=torch.long)],
+                                    dim=1),
+
+                'ss': torch.cat([ref_data['ss'][fixed_mask][None, :], torch.zeros(size=(
+                    ref_data['ss'].shape[0], Length), device=self.device, dtype=torch.long)],
+                                dim=1),
+
+                'res_idx': torch.cat(
+                    [ref_data['res_idx'][fixed_mask][None, :], torch.range(1, Length).unsqueeze(0).to(self.device)],
+                    dim=1),
+
+                'res_mask': torch.cat([ref_data['res_mask'][fixed_mask][None, :], torch.ones(size=(
+                    ref_data['ss'].shape[0], Length), device=self.device)],
+                                      dim=1),
+
+                'com_idx': new_com_idx
+
+            }
+
+            fixed_mask = ~torch.isin(new_com_idx, desgin_comidx)
+            fixed_mask = fixed_mask.to(self.device)
 
 
+            self.Proflow.set_device(self.device)
+            new_batch['fixed_mask'] = fixed_mask
+
+            for i,add in enumerate( add_path):
+                add_PdbDataset = sPdbDataset(add, is_training=False)
+                add_data = add_PdbDataset[0]
+                add_data = {
+                    key: torch.tensor(value).unsqueeze(0).to(self.device)
+                    if isinstance(value, np.ndarray) else value.unsqueeze(0).to(self.device)
+                    for key, value in add_data.items()
+                }
+                # 修改：Target和fixed_by_chain分别从add_target和add_fixed_by_chain取
+                add_com_idx = add_data['com_idx']
+                add_Target = add_target[i]
+                add_Target = torch.tensor(add_Target, device=com_idx.device)
+                add_fixed_mask = ~torch.isin(add_com_idx, add_Target)
+
+                add_fixed_by_chain = add_fixed_by_chain[i] if add_fixed_by_chain is not None else None
+                if add_fixed_by_chain is not None:
+                    add_chain_target = torch.tensor(add_fixed_by_chain, device=add_com_idx.device)
+                    add_fixed_chain = torch.isin(add_data['chain_idx'], add_chain_target)
+                    add_fixed_mask = add_fixed_mask & add_fixed_chain
+                    print(f'add_fixed_mask {i}: ', add_fixed_mask.sum())
+                    add_this_data=add_data['aatype'][add_fixed_mask][None, :]
+
+
+
+
+                    # 1. 取 N = fixed_mask.sum()
+                    N = fixed_mask.sum().item()
+                    # 2. 取 add_data 里前 N 个
+                    add_atoms14 = add_data['atoms14'][:, :fixed_mask.shape[-1], ...]*fixed_mask.unsqueeze(-1).unsqueeze(-1)  # [B, N, 14, 3]
+                    # 3. 取 new_batch 里 fixed_mask 前 N 个
+                    new_atoms14 = new_batch['atoms14'][:, :fixed_mask.shape[-1],
+                                  ...]  # [B, N, 14, 3]
+
+                    # test1=new_atoms14-new_atoms14[...,1,:].unsqueeze(-2)
+                    # test2 = add_atoms14 - add_atoms14[..., 1, :].unsqueeze(-2)
+                    #
+                    # aligned_add_atoms14=align_pred_to_true(add_atoms14[...,:150,:,:].reshape(1,-1,3),new_atoms14[...,:150,:,:].reshape(1,-1,3),fixed_mask.unsqueeze(-1).expand(-1, -1, 14)[...,:150,:].reshape(1,-1))
+                    # rmsd = torch.sqrt(((aligned_add_atoms14 - new_atoms14) ** 2).sum() / (N*14))
+
+                    # def rigid_align_by_subset(A: torch.Tensor, B: torch.Tensor, core_len=150):
+                    #     """
+                    #     Align structure A to structure B using only the first `core_len` residues.
+                    #     A, B: [N, 3]
+                    #     Return: A_aligned [N, 3], rotation matrix R, RMSD on core region
+                    #     """
+                    #     assert A.shape == B.shape and A.ndim == 2 and A.shape[1] == 3
+                    #     A_core = A[:core_len]
+                    #     B_core = B[:core_len]
+                    #
+                    #     # 去质心
+                    #     A_mean = A_core.mean(dim=0, keepdim=True)
+                    #     B_mean = B_core.mean(dim=0, keepdim=True)
+                    #     A_centered = A_core - A_mean
+                    #     B_centered = B_core - B_mean
+                    #
+                    #     # Kabsch 旋转
+                    #     U, _, Vt = torch.linalg.svd(A_centered.T @ B_centered)
+                    #     R = Vt.T @ U.T
+                    #     if torch.det(R) < 0:
+                    #         Vt[-1] *= -1
+                    #         R = Vt.T @ U.T
+                    #
+                    #     # 应用于整个结构 A
+                    #     A_all_centered = A_centered - A_mean
+                    #     A_aligned = A_all_centered @ R + B_mean  # 平移回 B 的中心
+                    #
+                    #     # 核心区 RMSD
+                    #     rmsd = torch.sqrt(((A_aligned[:core_len] - B_centered) ** 2).sum() / core_len)
+                    #
+                    #     return A_aligned, B, rmsd
+                    #
+                    # aligned_add_atoms14, aligned_new_atoms14, rmsd=rigid_align_by_subset(add_atoms14.reshape(1, -1, 3).squeeze(0)    ,
+                    #                                                                       new_atoms14.reshape(1, -1, 3).squeeze(0),
+                    #                                                                       150*14)
+
+                    # 4. 对齐
+                    aligned_add_atoms14, aligned_new_atoms14, R = du.batch_align_structures(
+                        add_atoms14.reshape(1, -1, 3)    , new_atoms14.reshape(1, -1, 3), mask=fixed_mask.unsqueeze(-1).expand(-1, -1, 14).reshape(1, -1)  # [1, N, 42]
+                    )
+                    # 5. 替换 add_data 里的前 N 个
+                    add_data['atoms14']= aligned_add_atoms14.reshape(1,new_atoms14.shape[1],new_atoms14.shape[2] ,3)
+
+
+                new_batch['atoms14']=aligned_new_atoms14.reshape(1,new_atoms14.shape[1],new_atoms14.shape[2] ,3)
+
+                # 2. 将 add_data 的每一项添加进 new_batch，形成 batch size=2
+                L = fixed_mask.shape[1]  # 以 fixed_mask 的长度为准
+
+                for key in new_batch:
+                    if key in add_data and isinstance(new_batch[key], torch.Tensor) and isinstance(add_data[key],
+                                                                                                   torch.Tensor):
+                        # 1. 先调整 add_data[key] 的长度为 L
+                        add_val = add_data[key]
+                        add_len = add_val.shape[1]
+                        if add_len < L:
+                            # padding
+                            pad_shape = list(add_val.shape)
+                            pad_shape[1] = L - add_len
+                            pad_tensor = torch.zeros(pad_shape, dtype=add_val.dtype, device=add_val.device)
+                            add_val = torch.cat([add_val, pad_tensor], dim=1)
+                        elif add_len > L:
+                            # 裁剪
+                            add_val = add_val[:, :L, ...]
+                        # 2. mask
+                        mask = fixed_mask
+                        while mask.dim() < add_val.dim():
+                            mask = mask.unsqueeze(-1)
+                        masked_add_val = add_val * mask
+                        # 3. 拼接
+                        new_batch[key] = torch.cat([new_batch[key], masked_add_val], dim=0)
+                B = fixed_mask.shape[0]  # 以 fixed_mask 的长度为准
+
+                new_batch['fixed_mask'] = fixed_mask.expand(B+len(add_path),-1)
+            if hotspot:
+                center_of_mass, centered_atoms14 = self.compute_center_of_mass(hotspot, new_batch['chain_idx'][0],
+                                                                               new_batch['res_idx'][0],
+                                                                               new_batch['atoms14'])
+
+
+
+                new_batch['atoms14'] = centered_atoms14
+
+                t1=new_batch['atoms14'][0]
+                t2 = new_batch['atoms14'][1]
+                t0=t2-t1
+                noisy_batch = self.Proflow.corrupt_batch_DYNbinder(new_batch, 'fp32',  new_batch['fixed_mask'] , design_num, t=0,
+                                                                design=True, path=design_path, hotspot=True)
+            else:
+
+                noisy_batch = self.Proflow.corrupt_batch_DYNbinder(new_batch, 'fp32', fixed_mask, design_num, t=0,
+                                                                design=True, path=design_path, hotspot=False)
+
+            samples = self.Proflow.hybrid_DYN_binder_sample(
+                self._model,
+                noisy_batch,
+                num_steps=200,
+
+            )
+            for i in range(samples[0].shape[0]):
+
+                    X = samples[0][i].unsqueeze(0)
+                    C = samples[1][0].unsqueeze(0)
+                    S = samples[2][i].unsqueeze(0)
+                    BF = samples[3][i].unsqueeze(0)
+
+                    p = Protein.from_XCSB(X, C, S, BF)
+                    p.to_PDB(folder_path
+                             + design_name + '_' + str(design_num) + '_design_batch' + str(i) + '.pdb')
 
     def parse_hotspot(self,hotspot, chain_idx):
         """
@@ -1031,19 +1323,27 @@ class Proflow(nn.Module):
         selected_atoms = []
         for chain, res in parsed_hotspots:
             mask = (chain_idx == chain) & (res_idx == res)
-            selected_atoms.append(atoms14[mask, 1, :])  # 提取Ca原子的坐标
+
+            if len(atoms14.shape)==4:
+
+                selected_atoms.append(atoms14[:,mask, 1, :])  # 提取Ca原子的坐标
+            else:
+                selected_atoms.append(atoms14[mask, 1, :])
 
         if len(selected_atoms) == 0:
             raise ValueError("No atoms found for the given hotspots.")
 
         # 合并所有选定的原子
-        selected_atoms = torch.cat(selected_atoms, dim=0)
+        selected_atoms = torch.cat(selected_atoms, dim=len(atoms14.shape)-3)
 
         # 计算重心
-        center_of_mass = selected_atoms.mean(dim=0)
+        center_of_mass = selected_atoms.mean(dim=len(atoms14.shape)-3)
 
         # 使用重心中心化所有的原子坐标
-        centered_atoms14 = atoms14 - center_of_mass
+        if len(atoms14.shape) == 4:
+            centered_atoms14 = atoms14 - center_of_mass[:, None, None, :]
+        else:
+            centered_atoms14 = atoms14 - center_of_mass
 
         return center_of_mass, centered_atoms14
 
@@ -1146,9 +1446,9 @@ def main(cfg):
 
 
     proflow = Proflow(cfg)
-    a = 60  # 起始值
-    b = 1000  # 结束值，不包括在内
-    n = 20  # 间隔
+    a = 30  # 起始值
+    b = 100  # 结束值，不包括在内
+    n = 5  # 间隔
     sequence = list(range(a, b, n))
     sample_length=sequence
     
@@ -1177,10 +1477,11 @@ def main(cfg):
         
         # 根据配置选择使用哪个采样方法
         sampling_method = cfg.inference.sampling_method
-        
+      # 会生成 outputs/exp1/config.yaml 和 config.json
+
         if sampling_method == "hotspot":
             # 使用带热点的采样方法
-            proflow.sample_binder_bylength_hotspot(
+            outputpath=proflow.sample_binder_bylength_hotspot(
                 Target=cfg.inference.target_com_idx, 
                 design_num=i, 
                 Length=length,
@@ -1190,6 +1491,23 @@ def main(cfg):
                 base_path=cfg.inference.base_path,
                 ref_path=cfg.inference.ref_path
             )
+            save_cfg(cfg, outputpath+"/exp1")
+        elif sampling_method == "addhotspot":
+            # 使用带热点的采样方法
+            proflow.sample_DYNbinder_bylength_hotspot(
+                Target=cfg.inference.target_com_idx,
+                design_num=i,
+                Length=length,
+                hotspot=cfg.inference.hotspot if hasattr(cfg.inference, 'hotspot') else [],
+                fixed_by_chain=cfg.inference.fixed_by_chain if hasattr(cfg.inference, 'fixed_by_chain') else None,
+                design_class_name=cfg.inference.design_class_name,
+                base_path=cfg.inference.base_path,
+                ref_path=cfg.inference.ref_path,
+                add_path=cfg.inference.add_path,
+                add_target=cfg.inference.add_target_com_idx,
+                add_fixed_by_chain=cfg.inference.add_fixed_by_chain
+            )
+
         elif sampling_method == "reference":
             # 使用参考链的采样方法
             proflow.sample_binder_bylength_reference(

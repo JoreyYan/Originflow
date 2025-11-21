@@ -55,7 +55,7 @@ def analysis():
     plt.savefig(density_plot_path)
     plt.close()
 def colletdata():
-    config = OmegaConf.load("/home/junyu/project/frame-flow-main/configs/binder_design.yaml")
+    config = OmegaConf.load("../configs/binder_design.yaml")
 
     dataset_cfg=config.data.dataset
 

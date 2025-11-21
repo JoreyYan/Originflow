@@ -10,7 +10,7 @@ from omegaconf import DictConfig, OmegaConf
 from experiments import utils as eu
 from models.flow_module import FlowModule
 import sys
-
+from datetime import datetime
 torch.set_float32_matmul_precision('high')
 log = eu.get_pylogger(__name__)
 from utils import set_global_seed
@@ -23,9 +23,19 @@ class Sampler:
             cfg: inference config.
         """
 
-        if parsed_args.design_task == 'monomer':
+        if parsed_args.design_task == 'monomer' and parsed_args.model=='motif':
             ckpt_path = cfg.inference.ckpt_motif_path
             cfg.design_task = 'monomer'
+        elif parsed_args.design_task == 'monomer' and parsed_args.model=='base':
+            ckpt_path = cfg.inference.ckpt_path
+            cfg.design_task = 'monomer'
+        elif parsed_args.design_task == 'monomer' and parsed_args.model=='motif_base_ss':
+            ckpt_path = cfg.inference.ckpt_path
+            cfg.design_task = 'monomer'
+
+        elif parsed_args.design_task == 'homomer':
+            ckpt_path = cfg.inference.ckpt_motif_path
+            cfg.design_task = 'homomer'
 
         else:
             cfg.design_task = 'monomer_ss'
@@ -47,7 +57,7 @@ class Sampler:
         self._output_dir = os.path.join(
             self._infer_cfg.output_dir,
             self._ckpt_name,
-            self._infer_cfg.name,
+            f"{self._infer_cfg.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         )
         os.makedirs(self._output_dir, exist_ok=True)
         log.info(f'Saving results to {self._output_dir}')
@@ -60,8 +70,8 @@ class Sampler:
         # init_FlowModule=FlowModule(cfg)
         # print(f'ckpt_path: {ckpt_path}')
         # x=torch.load(ckpt_path)
-        # x['hyper_parameters']['cfg']['model']['ipa']['c_s']='${model.node_embed_size}'
-        # torch.save(x,ckpt_path.split('.')[0]+'motif_forbase_sscondition.ckpt')
+        # x['hyper_parameters']['cfg']['experiment']['corrupt_mode']='base'
+        # torch.save(x,ckpt_path.split('.')[0]+'baselast.ckpt')
 
 
         self._flow_module = FlowModule.load_from_checkpoint(
@@ -86,7 +96,7 @@ class Sampler:
         trainer = Trainer(
             accelerator="gpu",
             devices=devices,
-            precision=32,
+            precision=32, #'16-mixed'
         )
 
         trainer.predict(self._flow_module, dataloaders=dataloader)
@@ -126,8 +136,46 @@ def run_ss(cfg: DictConfig) -> None:
                 log.info(f'Finished in {elapsed_time:.2f}s')
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="inference_base")
+@hydra.main(version_base=None, config_path="../configs", config_name="inference_unmotif")
 def run(cfg: DictConfig) -> None:
+
+    lam=[1 ]
+
+    for l0 in lam:
+        cfg.inference.lam=l0
+
+
+        # Read model checkpoint.
+        log.info(f'Starting inference with {cfg.inference.num_gpus} GPUs')
+        start_time = time.time()
+
+
+        sampler = Sampler(cfg)
+        sampler.run_sampling()
+        elapsed_time = time.time() - start_time
+        log.info(f'Finished in {elapsed_time:.2f}s')
+
+
+@hydra.main(version_base=None, config_path="../configs", config_name="inference_unbase")
+def run_base(cfg: DictConfig) -> None:
+
+    lam=[1 ]
+
+    for l0 in lam:
+        cfg.inference.lam=l0
+
+
+        # Read model checkpoint.
+        log.info(f'Starting inference with {cfg.inference.num_gpus} GPUs')
+        start_time = time.time()
+
+
+        sampler = Sampler(cfg)
+        sampler.run_sampling()
+        elapsed_time = time.time() - start_time
+        log.info(f'Finished in {elapsed_time:.2f}s')
+@hydra.main(version_base=None, config_path="../configs", config_name="inference_base_ss")
+def run_unwithbasess(cfg: DictConfig) -> None:
 
     lam=[1 ]
 
@@ -150,7 +198,10 @@ if __name__ == '__main__':
     import argparse
     
     parser = argparse.ArgumentParser()
-    parser.add_argument('--design_task', type=str, default='monomer', choices=['monomer', 'monomer_ss'], help='Design task type')
+    parser.add_argument('--design_task', type=str, default='monomer', choices=['monomer', 'monomer_ss','homomer'], help='Design task type')
+    parser.add_argument('--model', type=str, default='motif', choices=['motif', 'base', 'motif_base_ss'],
+                        help='which model type')
+
     args, unknown = parser.parse_known_args()
     
     # Store args in a global variable for access in Sampler
@@ -159,7 +210,11 @@ if __name__ == '__main__':
 
     set_global_seed(42)
     # Choose which function to run based on design_task
-    if args.design_task == 'monomer':
+    if (args.design_task == 'monomer' or args.design_task == 'homomer' ) and args.model == 'motif':
         run()
+    elif (args.design_task == 'monomer' or args.design_task == 'homomer' ) and args.model == 'base':
+        run_base()
+    elif args.design_task == 'monomer' and args.model == 'motif_base_ss':
+        run_unwithbasess()
     elif args.design_task == 'monomer_ss':
         run_ss()

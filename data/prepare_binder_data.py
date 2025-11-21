@@ -71,7 +71,7 @@ def main():
     parser.add_argument(
         '--pdb_dir',
         help='Path to the directory containing PDB files',
-        default='//home/junyu/project/binder_target/1bj1/',
+        default='//home/junyu/project/binder_target/ni2k/',
     )
     args = parser.parse_args()
 
